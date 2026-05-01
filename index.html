@@ -6,6 +6,8 @@
 <title>HRForge — Hiring Optimization for HR Freelancers</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
@@ -116,7 +118,7 @@
     return { id: r.id, clientId: r.client_id, title: r.title, seniority: r.seniority || '', location: r.location || '', workMode: r.work_mode || '', priority: r.priority || 'medium', status: r.status || 'open', description: r.description || '', requirements: r.requirements || '', createdAt: new Date(r.created_at).getTime() };
   }
   function rowToCandidate(r) {
-    return { id: r.id, name: r.name, email: r.email || '', phone: r.phone || '', currentRole: r.current_title || '', currentCompany: r.current_company || '', yearsExperience: r.years_experience, skills: r.skills || [], summary: r.summary || '', source: r.source || '', aiSummary: r.ai_summary || null, createdAt: new Date(r.created_at).getTime() };
+    return { id: r.id, name: r.name, email: r.email || '', phone: r.phone || '', currentRole: r.current_title || '', currentCompany: r.current_company || '', yearsExperience: r.years_experience, skills: r.skills || [], summary: r.summary || '', source: r.source || '', aiSummary: r.ai_summary || null, resumePath: r.resume_path || null, createdAt: new Date(r.created_at).getTime() };
   }
   function rowToApplication(r) {
     return { id: r.id, candidateId: r.candidate_id, jobId: r.job_id, stage: r.stage || 'applied', fitScore: r.fit_score, fitSummary: r.fit_summary, strengths: r.strengths || [], gaps: r.gaps || [], createdAt: new Date(r.created_at).getTime() };
@@ -283,6 +285,40 @@ For each, include what to look for in a strong answer. Return ONLY valid JSON, n
     return await callClaudeJSON(system, `Title: ${job.title}\nSeniority: ${job.seniority || 'unknown'}\nDescription: ${job.description}\nRequirements: ${job.requirements}`, { maxTokens: 1800 });
   }
 
+  async function aiMatchAnalysis({ candidate, job }) {
+    const system = `You are an expert recruiter doing a rigorous match analysis between a candidate and a specific role. Your output drives a hiring decision, so be honest and specific.
+
+Process:
+1. Extract 5-8 concrete required skills/competencies from the job's requirements.
+2. For each, judge whether the candidate has it: "strong" (clear evidence), "partial" (related/adjacent experience), or "missing" (no evidence).
+3. Identify any critical missing requirements (must-haves the candidate clearly lacks).
+4. Compute an overall match score 0-100 weighted toward strong skill matches and critical missing items.
+5. Write a 3-sentence summary: who the candidate is, why they're a fit (or not), the single biggest concern.
+6. Recommend one of: "strong-fit" (interview immediately), "worth-interviewing" (worth a screen), "weak-fit" (likely pass).
+
+Return ONLY valid JSON, no preamble:
+{
+  "matchScore": <integer 0-100>,
+  "summary": "<3 sentences>",
+  "skillsMatch": [
+    {"skill": "<the required skill>", "match": "strong"|"partial"|"missing", "evidence": "<1 sentence: what in the candidate's profile supports this judgement>"}
+  ],
+  "missingCritical": ["<critical must-have they lack>"],
+  "recommendation": "strong-fit"|"worth-interviewing"|"weak-fit",
+  "recommendationReason": "<1 sentence>"
+}`;
+    const candidateBlock = `Name: ${candidate.name}
+Current: ${candidate.currentRole || 'unknown'} at ${candidate.currentCompany || 'unknown'}
+Experience: ${candidate.yearsExperience || 'unknown'} years
+Skills: ${(candidate.skills || []).join(', ') || 'none listed'}
+Summary: ${candidate.summary || 'none'}`;
+    const jobBlock = `Title: ${job.title}
+Seniority: ${job.seniority || 'unknown'}
+Description: ${job.description || ''}
+Requirements: ${job.requirements || ''}`;
+    return await callClaudeJSON(system, `CANDIDATE:\n${candidateBlock}\n\nROLE:\n${jobBlock}\n\nDo the match analysis.`, { maxTokens: 2000 });
+  }
+
   async function aiCandidateSummary({ candidate, applications, jobs }) {
     const apps = applications.map(a => {
       const j = jobs.find(x => x.id === a.jobId);
@@ -298,6 +334,78 @@ Summary: ${candidate.summary || ''}
 Active applications:
 ${apps}`;
     return await callClaude(system, user, { maxTokens: 400 });
+  }
+
+  // =============================================================================
+  // Resume file handling — pending upload state + text extraction (PDF/DOCX/TXT)
+  // =============================================================================
+  let pendingResumeFile = null; // File pending upload after candidate creation
+
+  // Configure pdf.js worker (required for the library to work)
+  if (window.pdfjsLib) {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+
+  async function extractTextFromFile(file) {
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (ext === 'pdf') return await extractTextFromPDF(file);
+    if (ext === 'docx') return await extractTextFromDOCX(file);
+    if (ext === 'txt' || ext === 'rtf' || ext === 'md') return await file.text();
+    if (ext === 'doc') {
+      throw new Error('Old .doc files aren\'t supported in-browser. Save as .docx or .pdf and try again.');
+    }
+    throw new Error(`Unsupported file type: .${ext}. Use .pdf, .docx, or .txt.`);
+  }
+
+  async function extractTextFromPDF(file) {
+    if (!window.pdfjsLib) throw new Error('PDF library not loaded');
+    const buf = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+    let fullText = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      fullText += content.items.map(it => it.str).join(' ') + '\n\n';
+    }
+    return fullText.trim();
+  }
+
+  async function extractTextFromDOCX(file) {
+    if (!window.mammoth) throw new Error('DOCX library not loaded');
+    const buf = await file.arrayBuffer();
+    const result = await window.mammoth.extractRawText({ arrayBuffer: buf });
+    return (result.value || '').trim();
+  }
+
+  // Storage helpers
+  async function uploadResumeFile(candidateId, file) {
+    if (!file || !state.user) return null;
+    const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
+    const path = `${state.user.id}/${candidateId}/resume.${ext}`;
+    const { error } = await supabase.storage.from('resumes').upload(path, file, {
+      upsert: true,
+      contentType: file.type || 'application/octet-stream',
+    });
+    if (error) throw new Error('Resume upload failed: ' + error.message);
+    return path;
+  }
+
+  async function getResumeSignedUrl(path) {
+    if (!path) return null;
+    const { data, error } = await supabase.storage.from('resumes').createSignedUrl(path, 3600);
+    if (error) return null;
+    return data?.signedUrl || null;
+  }
+
+  async function deleteResumeFolder(candidateId) {
+    if (!state.user) return;
+    const prefix = `${state.user.id}/${candidateId}`;
+    const { data: files } = await supabase.storage.from('resumes').list(prefix);
+    if (files && files.length > 0) {
+      const paths = files.map(f => `${prefix}/${f.name}`);
+      await supabase.storage.from('resumes').remove(paths);
+    }
   }
 
   // =============================================================================
@@ -474,6 +582,10 @@ ${apps}`;
   // Navigation
   // =============================================================================
   function go(view, params = {}) {
+    // If leaving candidate-new without submitting, drop any pending file
+    if (state.view === 'candidateNew' && view !== 'candidateNew') {
+      pendingResumeFile = null;
+    }
     state.view = view;
     state.params = params;
     state.error = null;
@@ -569,6 +681,7 @@ ${apps}`;
     if (patch.summary != null) row.summary = patch.summary;
     if (patch.source != null) row.source = patch.source;
     if (patch.aiSummary !== undefined) row.ai_summary = patch.aiSummary;
+    if (patch.resumePath !== undefined) row.resume_path = patch.resumePath;
     const { data, error } = await supabase.from('candidates').update(row).eq('id', candidateId).select().single();
     if (error) { toast('Update candidate failed: ' + error.message, 'error'); return; }
     const idx = state.data.candidates.findIndex(c => c.id === candidateId);
@@ -1365,6 +1478,26 @@ ${apps}`;
             </span>
             <h3 class="text-sm font-semibold">Parse resume with AI</h3>
           </div>
+
+          <!-- File upload -->
+          <div class="mb-3">
+            <label class="mb-1.5 block text-xs font-medium uppercase tracking-wider text-slate-500">Upload file (PDF, DOCX, TXT)</label>
+            <div class="flex flex-wrap items-center gap-2">
+              <label class="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                Choose file
+                <input type="file" id="resume-file-input" accept=".pdf,.docx,.txt,.doc,.rtf,.md" class="hidden" data-action="resume-file-selected" />
+              </label>
+              <span id="resume-file-name" class="text-xs text-slate-500">${pendingResumeFile ? '✓ ' + escapeHTML(pendingResumeFile.name) + ' (' + Math.round(pendingResumeFile.size/1024) + ' KB)' : 'No file selected'}</span>
+              ${pendingResumeFile ? `<button type="button" data-action="resume-file-clear" class="text-xs text-rose-600 hover:underline">Remove</button>` : ''}
+            </div>
+            <p class="mt-1 text-[11px] text-slate-500">Text is auto-extracted into the box below. The original file is also saved to the candidate's profile.</p>
+          </div>
+
+          <div class="my-3 flex items-center gap-2 text-[11px] uppercase tracking-wider text-slate-400">
+            <span class="h-px flex-1 bg-slate-200"></span><span>or paste text</span><span class="h-px flex-1 bg-slate-200"></span>
+          </div>
+
           <textarea id="ai-resume" rows="6" placeholder="Paste resume text or LinkedIn profile here…" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20"></textarea>
           <button type="button" data-action="ai-parse-resume" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60" ${state.aiLoading.parse?'disabled':''}>
             ${state.aiLoading.parse ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
@@ -1431,6 +1564,9 @@ ${apps}`;
     if (!k) return renderShell(`<div class="p-10 text-center text-sm text-slate-500">Candidate not found. <a href="#" data-action="go" data-view="candidates" class="text-brand-600">Back</a></div>`);
     const apps = applicationsForCandidate(k.id);
     const summary = state.params.aiSummary || k.aiSummary;
+    const matchResult = state.params.matchResult; // populated after Match Analysis run
+    const matchJobId = state.params.matchJobId || (state.data.jobs[0] && state.data.jobs[0].id) || '';
+    const matchLoadingKey = 'match:' + k.id;
 
     return renderShell(`
       <div class="mx-auto max-w-5xl px-4 py-8 md:px-6 md:py-10">
@@ -1447,10 +1583,16 @@ ${apps}`;
               <p class="mt-1 text-xs text-slate-500">${escapeHTML(k.email || '')}${k.phone ? ' · ' + escapeHTML(k.phone) : ''}${k.source ? ' · Source: ' + escapeHTML(k.source) : ''}</p>
             </div>
           </div>
-          <button data-action="ai-summary" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-60" ${state.aiLoading['summary:'+k.id]?'disabled':''}>
-            ${state.aiLoading['summary:'+k.id] ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
-            ${state.aiLoading['summary:'+k.id] ? 'Generating…' : 'AI: Client-ready summary'}
-          </button>
+          <div class="flex flex-wrap gap-2">
+            <button data-action="ai-summary" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-60" ${state.aiLoading['summary:'+k.id]?'disabled':''}>
+              ${state.aiLoading['summary:'+k.id] ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+              ${state.aiLoading['summary:'+k.id] ? 'Generating…' : 'AI: Client-ready summary'}
+            </button>
+            <button data-action="delete-candidate" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md border border-rose-200 bg-white px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-50">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+              Delete
+            </button>
+          </div>
         </header>
 
         ${summary ? `
@@ -1462,6 +1604,84 @@ ${apps}`;
             <p class="text-sm leading-relaxed text-slate-800">${escapeHTML(summary)}</p>
           </section>
         ` : ''}
+
+        <!-- ========== Match against a role ========== -->
+        <section class="mb-6 rounded-lg border-2 border-dashed border-brand-200 bg-brand-50/40 p-5">
+          <div class="mb-3 flex items-center gap-2">
+            <span class="grid h-7 w-7 place-items-center rounded-md bg-brand-600 text-white">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            </span>
+            <h3 class="text-sm font-semibold">Match against a role</h3>
+          </div>
+          ${state.data.jobs.length === 0 ? `
+            <p class="text-xs text-slate-500">No jobs in your workspace yet. <a href="#" data-action="go" data-view="jobNew" class="font-medium text-brand-600">Create a job</a> to run a match.</p>
+          ` : `
+            <p class="mb-3 text-xs text-slate-600">Pick a role and Claude will analyze skill alignment, flag missing requirements, and recommend whether to interview.</p>
+            <div class="flex flex-wrap items-center gap-2">
+              <select data-action="set-match-job" class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm">
+                ${state.data.jobs.map(j => {
+                  const c = clientById(j.clientId);
+                  return `<option value="${j.id}" ${j.id===matchJobId?'selected':''}>${escapeHTML(j.title)}${c ? ' — ' + escapeHTML(c.name) : ''}</option>`;
+                }).join('')}
+              </select>
+              <button data-action="ai-match" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60" ${state.aiLoading[matchLoadingKey]?'disabled':''}>
+                ${state.aiLoading[matchLoadingKey] ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+                ${state.aiLoading[matchLoadingKey] ? 'Analyzing…' : 'Analyze match'}
+              </button>
+            </div>
+          `}
+
+          ${matchResult ? `
+            <div class="mt-5 space-y-4 rounded-md border border-slate-200 bg-white p-5">
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <p class="text-xs font-medium uppercase tracking-wider text-slate-500">Match score</p>
+                  <p class="mt-1 text-3xl font-semibold tabular-nums ${matchResult.matchScore >= 75 ? 'text-emerald-700' : matchResult.matchScore >= 50 ? 'text-amber-700' : 'text-rose-700'}">${matchResult.matchScore}<span class="text-base font-normal text-slate-500">/100</span></p>
+                </div>
+                <span class="rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wider ${
+                  matchResult.recommendation === 'strong-fit' ? 'bg-emerald-100 text-emerald-700' :
+                  matchResult.recommendation === 'worth-interviewing' ? 'bg-amber-100 text-amber-700' :
+                  'bg-rose-100 text-rose-700'
+                }">${escapeHTML((matchResult.recommendation || '').replace(/-/g,' '))}</span>
+              </div>
+
+              <p class="text-sm leading-relaxed text-slate-700">${escapeHTML(matchResult.summary || '')}</p>
+
+              ${Array.isArray(matchResult.skillsMatch) && matchResult.skillsMatch.length > 0 ? `
+                <div>
+                  <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">Skill alignment</p>
+                  <ul class="space-y-1.5">
+                    ${matchResult.skillsMatch.map(s => {
+                      const cls = s.match === 'strong' ? 'bg-emerald-100 text-emerald-700' : s.match === 'partial' ? 'bg-amber-100 text-amber-700' : 'bg-rose-100 text-rose-700';
+                      const icon = s.match === 'strong' ? '✓' : s.match === 'partial' ? '~' : '✗';
+                      return `
+                        <li class="flex items-start gap-2 rounded-md border border-slate-100 p-2.5">
+                          <span class="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full ${cls} text-xs font-bold">${icon}</span>
+                          <div class="min-w-0 flex-1">
+                            <p class="text-sm font-medium">${escapeHTML(s.skill || '')}</p>
+                            ${s.evidence ? `<p class="mt-0.5 text-xs text-slate-600">${escapeHTML(s.evidence)}</p>` : ''}
+                          </div>
+                        </li>`;
+                    }).join('')}
+                  </ul>
+                </div>
+              ` : ''}
+
+              ${Array.isArray(matchResult.missingCritical) && matchResult.missingCritical.length > 0 ? `
+                <div>
+                  <p class="mb-2 text-xs font-semibold uppercase tracking-wider text-rose-700">Missing critical requirements</p>
+                  <ul class="list-disc space-y-1 pl-5 text-sm text-slate-700">
+                    ${matchResult.missingCritical.map(m => `<li>${escapeHTML(m)}</li>`).join('')}
+                  </ul>
+                </div>
+              ` : ''}
+
+              ${matchResult.recommendationReason ? `
+                <p class="rounded-md bg-slate-50 p-3 text-xs italic text-slate-700">${escapeHTML(matchResult.recommendationReason)}</p>
+              ` : ''}
+            </div>
+          ` : ''}
+        </section>
 
         <div class="grid gap-6 lg:grid-cols-3">
           <article class="rounded-lg border border-slate-200 bg-white p-6 lg:col-span-2">
@@ -1475,6 +1695,17 @@ ${apps}`;
                 <dt class="text-xs uppercase tracking-wider text-slate-500">Source</dt>
                 <dd class="mt-0.5 text-sm">${escapeHTML(k.source || '—')}</dd>
               </div>
+              ${k.resumePath ? `
+                <div class="sm:col-span-2">
+                  <dt class="text-xs uppercase tracking-wider text-slate-500">Resume</dt>
+                  <dd class="mt-1">
+                    <button data-action="download-resume" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium hover:bg-slate-50">
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                      Download resume
+                    </button>
+                  </dd>
+                </div>
+              ` : ''}
               <div class="sm:col-span-2">
                 <dt class="text-xs uppercase tracking-wider text-slate-500">Skills</dt>
                 <dd class="mt-1 flex flex-wrap gap-1.5">${(k.skills||[]).map(s => `<span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">${escapeHTML(s)}</span>`).join('') || '—'}</dd>
@@ -1753,6 +1984,25 @@ ${apps}`;
       } else if (action === 'ai-summary') {
         e.preventDefault();
         handleAICandidateSummary(target.dataset.candidate);
+      } else if (action === 'ai-match') {
+        e.preventDefault();
+        handleAIMatchAnalysis(target.dataset.candidate);
+      } else if (action === 'delete-candidate') {
+        e.preventDefault();
+        handleDeleteCandidate(target.dataset.candidate);
+      } else if (action === 'download-resume') {
+        e.preventDefault();
+        handleDownloadResume(target.dataset.candidate);
+      } else if (action === 'resume-file-clear') {
+        e.preventDefault();
+        pendingResumeFile = null;
+        const span = document.getElementById('resume-file-name');
+        if (span) span.textContent = 'No file selected';
+        const input = document.getElementById('resume-file-input');
+        if (input) input.value = '';
+        // remove the "Remove" button by hiding it
+        const removeBtn = document.querySelector('[data-action="resume-file-clear"]');
+        if (removeBtn) removeBtn.remove();
       } else if (action === 'open-add-candidate') {
         e.preventDefault();
         showAddCandidateModal(target.dataset.job);
@@ -1770,13 +2020,32 @@ ${apps}`;
     };
 
     document.body.onchange = async (e) => {
-      const target = e.target.closest('[data-action="move-stage"]');
-      if (!target) return;
-      const appId = target.dataset.app;
-      const newStage = target.value;
-      await updateApplication(appId, { stage: newStage });
-      toast('Stage updated', 'success');
-      render();
+      // Move pipeline stage
+      const moveTarget = e.target.closest('[data-action="move-stage"]');
+      if (moveTarget) {
+        const appId = moveTarget.dataset.app;
+        const newStage = moveTarget.value;
+        await updateApplication(appId, { stage: newStage });
+        toast('Stage updated', 'success');
+        render();
+        return;
+      }
+      // Match-against-role dropdown
+      const matchSelect = e.target.closest('[data-action="set-match-job"]');
+      if (matchSelect) {
+        state.params.matchJobId = matchSelect.value;
+        // Clear any prior result so it doesn't look stale for a new job
+        state.params.matchResult = null;
+        render();
+        return;
+      }
+      // Resume file selected
+      const fileInput = e.target.closest('[data-action="resume-file-selected"]');
+      if (fileInput) {
+        const file = fileInput.files && fileInput.files[0];
+        if (file) await handleResumeFileSelected(file);
+        return;
+      }
     };
 
     // Close client-switcher when clicking outside
@@ -1844,6 +2113,21 @@ ${apps}`;
     };
     if (!payload.name) { state.error = 'Name is required.'; render(); return; }
     const k = await createCandidate(payload);
+    if (!k) return; // createCandidate already toasted the error
+
+    // If a file was selected, upload it now and link it to the new candidate
+    if (pendingResumeFile) {
+      try {
+        toast('Uploading resume…');
+        const path = await uploadResumeFile(k.id, pendingResumeFile);
+        if (path) await updateCandidate(k.id, { resumePath: path });
+        pendingResumeFile = null;
+      } catch (err) {
+        toast('Resume upload failed: ' + err.message, 'error');
+        // Don't abort — the candidate row was created successfully
+      }
+    }
+
     toast('Candidate added', 'success');
     go('candidateDetail', { candidateId: k.id });
   }
@@ -1996,6 +2280,85 @@ ${apps}`;
     closeModal();
     toast('Candidate added to job', 'success');
     render();
+  }
+
+  // -- File upload --
+  async function handleResumeFileSelected(file) {
+    // Hard cap: 10 MB
+    if (file.size > 10 * 1024 * 1024) {
+      toast('File is over 10 MB. Please upload something smaller.', 'error');
+      return;
+    }
+    pendingResumeFile = file;
+    const span = document.getElementById('resume-file-name');
+    if (span) span.textContent = `Reading ${file.name}…`;
+
+    try {
+      const text = await extractTextFromFile(file);
+      const ta = document.getElementById('ai-resume');
+      if (ta && text) ta.value = text;
+      if (span) span.textContent = `✓ ${file.name} (${Math.round(file.size/1024)} KB) — text extracted`;
+      toast('Text extracted. Click "Extract details" next.', 'success');
+    } catch (err) {
+      // Even if text extraction fails, the file is still queued for upload — user can paste manually
+      if (span) span.textContent = `${file.name} — couldn't extract text, paste manually`;
+      toast(err.message, 'error');
+    }
+  }
+
+  // -- Match against JD --
+  async function handleAIMatchAnalysis(candidateId) {
+    const k = candidateById(candidateId);
+    if (!k) return;
+    const jobId = state.params.matchJobId || (state.data.jobs[0] && state.data.jobs[0].id);
+    if (!jobId) { toast('No job selected', 'error'); return; }
+    const job = jobById(jobId);
+    if (!job) { toast('Job not found', 'error'); return; }
+
+    const loadKey = 'match:' + candidateId;
+    state.aiLoading[loadKey] = true; render();
+    try {
+      const result = await aiMatchAnalysis({ candidate: k, job });
+      delete state.aiLoading[loadKey];
+      // Re-render the same view with the result attached as a transient param
+      go('candidateDetail', { candidateId, matchJobId: jobId, matchResult: result });
+      toast(`Match score: ${result.matchScore}`, 'success');
+    } catch (err) {
+      delete state.aiLoading[loadKey];
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  // -- Delete candidate --
+  async function handleDeleteCandidate(candidateId) {
+    const k = candidateById(candidateId);
+    if (!k) return;
+    if (!confirm(`Delete ${k.name}? This will also remove all their applications and the resume file. This cannot be undone.`)) return;
+
+    try {
+      // Best-effort: delete resume folder first (failure is non-fatal)
+      await deleteResumeFolder(candidateId).catch(() => {});
+      // Then delete the row (cascades to applications via FK)
+      await deleteCandidate(candidateId);
+      toast('Candidate deleted', 'success');
+      go('candidates');
+    } catch (err) {
+      toast('Delete failed: ' + err.message, 'error');
+    }
+  }
+
+  // -- Download resume (signed URL, opens in new tab) --
+  async function handleDownloadResume(candidateId) {
+    const k = candidateById(candidateId);
+    if (!k || !k.resumePath) { toast('No resume on file', 'error'); return; }
+    try {
+      const url = await getResumeSignedUrl(k.resumePath);
+      if (!url) throw new Error('Could not generate download link');
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (err) {
+      toast('Download failed: ' + err.message, 'error');
+    }
   }
 
   // =============================================================================
