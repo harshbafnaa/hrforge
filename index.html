@@ -1,0 +1,2045 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HRForge — Hiring Optimization for HR Freelancers</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+<style>
+  html, body { font-family: 'Inter', system-ui, sans-serif; }
+  .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .fade-in { animation: fade-in .25s ease-out both; }
+  @keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .auth-bg {
+    background: #fafafa;
+    background-image:
+      radial-gradient(at 20% 0%, rgba(60,40,180,.06) 0, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(60,40,180,.04) 0, transparent 50%);
+  }
+  /* Pipeline horizontal scroll */
+  .pipeline-scroll::-webkit-scrollbar { height: 8px; }
+  .pipeline-scroll::-webkit-scrollbar-track { background: transparent; }
+  .pipeline-scroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }
+  /* Modal backdrop */
+  .modal-backdrop { animation: fade-in .15s ease-out both; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased">
+<div id="app" class="min-h-screen"></div>
+<div id="modal-root"></div>
+<div id="toast-root" class="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2"></div>
+
+<script>
+  // =============================================================================
+  // Tailwind theme — deep indigo brand accent
+  // =============================================================================
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          brand: {
+            50:'#f1efff', 100:'#e2dffe', 200:'#c5bcfd', 300:'#a59afb',
+            400:'#7d6cf0', 500:'#5e48d6', 600:'#3C28B4', 700:'#2f1f8c',
+            800:'#251879', 900:'#1a1057',
+          },
+        },
+      },
+    },
+  };
+
+  // =============================================================================
+  // Constants
+  // =============================================================================
+  const STAGES = [
+    { id: 'applied',    name: 'Applied',    color: 'bg-slate-100 text-slate-700 border-slate-200' },
+    { id: 'screening',  name: 'Screening',  color: 'bg-blue-100 text-blue-700 border-blue-200' },
+    { id: 'interview',  name: 'Interview',  color: 'bg-amber-100 text-amber-700 border-amber-200' },
+    { id: 'offer',      name: 'Offer',      color: 'bg-purple-100 text-purple-700 border-purple-200' },
+    { id: 'hired',      name: 'Hired',      color: 'bg-emerald-100 text-emerald-700 border-emerald-200' },
+    { id: 'rejected',   name: 'Rejected',   color: 'bg-rose-100 text-rose-700 border-rose-200' },
+  ];
+  const STAGE_BY_ID = Object.fromEntries(STAGES.map(s => [s.id, s]));
+
+  const CLIENT_COLORS = [
+    'bg-blue-500', 'bg-purple-500', 'bg-emerald-500', 'bg-amber-500',
+    'bg-rose-500', 'bg-cyan-500', 'bg-indigo-500', 'bg-pink-500',
+  ];
+
+  // =============================================================================
+  // App state
+  // =============================================================================
+  const state = {
+    view: 'loading',
+    params: {},
+    user: null,
+    activeClientId: null,
+    data: { clients: [], jobs: [], candidates: [], applications: [] },
+    error: null,
+    info: null,
+    submitting: false,
+    aiLoading: {}, // { [taskId]: true }
+    modal: null,
+  };
+
+  // =============================================================================
+  // Supabase client + row mappers
+  // =============================================================================
+  let supabase = null;
+
+  async function initSupabase() {
+    let url, key;
+    try {
+      const r = await fetch('/api/config');
+      if (r.ok) {
+        const cfg = await r.json();
+        url = cfg.supabaseUrl;
+        key = cfg.supabaseAnonKey;
+      }
+    } catch {}
+    if (!url || !key) {
+      throw new Error('Supabase config missing. Set SUPABASE_URL and SUPABASE_ANON_KEY env vars in Vercel.');
+    }
+    supabase = window.supabase.createClient(url, key, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+    });
+  }
+
+  // snake_case (DB) <-> camelCase (JS) mappers
+  function rowToClient(r) {
+    return { id: r.id, name: r.name, industry: r.industry, colorIdx: r.color_idx ?? 0, status: r.status || 'active', createdAt: new Date(r.created_at).getTime() };
+  }
+  function rowToJob(r) {
+    return { id: r.id, clientId: r.client_id, title: r.title, seniority: r.seniority || '', location: r.location || '', workMode: r.work_mode || '', priority: r.priority || 'medium', status: r.status || 'open', description: r.description || '', requirements: r.requirements || '', createdAt: new Date(r.created_at).getTime() };
+  }
+  function rowToCandidate(r) {
+    return { id: r.id, name: r.name, email: r.email || '', phone: r.phone || '', currentRole: r.current_title || '', currentCompany: r.current_company || '', yearsExperience: r.years_experience, skills: r.skills || [], summary: r.summary || '', source: r.source || '', aiSummary: r.ai_summary || null, createdAt: new Date(r.created_at).getTime() };
+  }
+  function rowToApplication(r) {
+    return { id: r.id, candidateId: r.candidate_id, jobId: r.job_id, stage: r.stage || 'applied', fitScore: r.fit_score, fitSummary: r.fit_summary, strengths: r.strengths || [], gaps: r.gaps || [], createdAt: new Date(r.created_at).getTime() };
+  }
+
+  // =============================================================================
+  // Data layer — fetch + mutate against Supabase, with RLS (owner_id = auth.uid)
+  // =============================================================================
+  async function fetchAllData() {
+    const [clientsRes, jobsRes, candidatesRes, applicationsRes] = await Promise.all([
+      supabase.from('clients').select('*').order('created_at', { ascending: false }),
+      supabase.from('jobs').select('*').order('created_at', { ascending: false }),
+      supabase.from('candidates').select('*').order('created_at', { ascending: false }),
+      supabase.from('applications').select('*').order('created_at', { ascending: false }),
+    ]);
+    for (const r of [clientsRes, jobsRes, candidatesRes, applicationsRes]) {
+      if (r.error) throw new Error(r.error.message);
+    }
+    return {
+      clients: (clientsRes.data || []).map(rowToClient),
+      jobs: (jobsRes.data || []).map(rowToJob),
+      candidates: (candidatesRes.data || []).map(rowToCandidate),
+      applications: (applicationsRes.data || []).map(rowToApplication),
+    };
+  }
+
+  async function reloadData() {
+    state.data = await fetchAllData();
+  }
+
+  // =============================================================================
+  // Auth helpers — Supabase Auth
+  // =============================================================================
+  async function getCurrentUser() {
+    const { data } = await supabase.auth.getUser();
+    if (!data?.user) return null;
+    return {
+      id: data.user.id,
+      email: data.user.email,
+      name: data.user.user_metadata?.name || data.user.email.split('@')[0],
+    };
+  }
+
+  // =============================================================================
+  // Utilities
+  // =============================================================================
+  const id = () => 'x' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  const escapeHTML = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const initials = (s) => (s||'?').split(/\s+/).filter(Boolean).slice(0,2).map(p=>p[0].toUpperCase()).join('') || '?';
+  const fmtDate = (ts) => new Date(ts).toLocaleDateString(undefined, { year:'numeric', month:'short', day:'numeric' });
+  const fmtRel = (ts) => {
+    const diff = Date.now() - ts;
+    const m = 60*1000, h = 60*m, d = 24*h;
+    if (diff < m) return 'just now';
+    if (diff < h) return Math.floor(diff/m) + ' min ago';
+    if (diff < d) return Math.floor(diff/h) + 'h ago';
+    if (diff < 7*d) return Math.floor(diff/d) + 'd ago';
+    return fmtDate(ts);
+  };
+
+  function toast(msg, kind='info') {
+    const root = document.getElementById('toast-root');
+    const el = document.createElement('div');
+    const cls = kind === 'error'
+      ? 'bg-red-600 text-white'
+      : kind === 'success'
+      ? 'bg-emerald-600 text-white'
+      : 'bg-slate-900 text-white';
+    el.className = `pointer-events-auto fade-in rounded-lg ${cls} px-4 py-2 text-sm shadow-lg`;
+    el.textContent = msg;
+    root.appendChild(el);
+    setTimeout(() => { el.style.transition = 'opacity .2s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 220); }, 3500);
+  }
+
+  // =============================================================================
+  // AI helpers — real calls to the Claude API
+  // =============================================================================
+  async function callClaude(system, user, { maxTokens = 1500 } = {}) {
+    const resp = await fetch('/api/claude', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: maxTokens,
+        system,
+        messages: [{ role: 'user', content: user }],
+      }),
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      throw new Error(`Claude API ${resp.status}: ${t.slice(0, 200)}`);
+    }
+    const data = await resp.json();
+    return data.content
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+  }
+
+  async function callClaudeJSON(system, user, opts = {}) {
+    const text = await callClaude(system, user, opts);
+    // Strip code fences and try to find a JSON object/array
+    let cleaned = text.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+    try { return JSON.parse(cleaned); } catch {}
+    const objMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (objMatch) { try { return JSON.parse(objMatch[0]); } catch {} }
+    throw new Error('AI returned invalid JSON. First 200 chars: ' + cleaned.slice(0, 200));
+  }
+
+  async function aiGenerateJD({ title, seniority, location, workMode, clientName, industry, brief }) {
+    const system = `You are an expert recruiter writing precise, specific job descriptions.
+Rules:
+- 2-3 sentence "about the role" intro woven into the description
+- 5-7 specific responsibilities (not generic)
+- 5-6 must-have requirements (concrete: years, technologies, certifications)
+- 3-4 nice-to-haves
+- No clichés like "rockstar", "ninja", "hit the ground running", "fast-paced"
+- Match the company context — a robotics company JD reads differently than a SaaS one
+Return ONLY valid JSON, no preamble, with this shape:
+{"description":"<markdown text with About + Responsibilities sections>","requirements":"<markdown text with Must-have + Nice-to-have sections>"}`;
+    const userMsg = `Role: ${title}
+Seniority: ${seniority || 'not specified'}
+Location: ${location || 'not specified'}
+Work mode: ${workMode || 'not specified'}
+Company: ${clientName || 'not specified'}
+Industry: ${industry || 'not specified'}
+Brief: ${brief || '(no extra context provided)'}
+
+Write the JD.`;
+    return await callClaudeJSON(system, userMsg, { maxTokens: 2000 });
+  }
+
+  async function aiParseResume(resumeText) {
+    const system = `Extract structured candidate data from this resume / LinkedIn / pasted profile text. Be conservative — if a field can't be confidently inferred, use null. Skills should be specific tools/technologies/methodologies, not soft skills. yearsExperience is a single integer (round to nearest year). Return ONLY valid JSON, no preamble, with this shape:
+{"name": string|null, "email": string|null, "phone": string|null, "currentRole": string|null, "currentCompany": string|null, "yearsExperience": number|null, "skills": string[], "summary": "2-3 sentence neutral overview"}`;
+    return await callClaudeJSON(system, resumeText, { maxTokens: 1200 });
+  }
+
+  async function aiFitScore({ candidate, job }) {
+    const system = `You are an expert recruiter. Score this candidate's fit for this role on a 0-100 scale. Be honest — don't inflate. Heuristic weighting: skills match 40%, experience level alignment 30%, role/domain alignment 20%, trajectory/seniority 10%. Return ONLY valid JSON, no preamble:
+{"score": <integer 0-100>, "summary": "<2 sentence overall fit>", "strengths": ["<3 specific strengths>"], "gaps": ["<2-3 specific gaps>"]}`;
+    const candidateBlock = `Name: ${candidate.name}
+Current role: ${candidate.currentRole || 'unknown'} at ${candidate.currentCompany || 'unknown'}
+Experience: ${candidate.yearsExperience || 'unknown'} years
+Skills: ${(candidate.skills || []).join(', ') || 'unknown'}
+Summary: ${candidate.summary || 'none'}`;
+    const jobBlock = `Title: ${job.title}
+Seniority: ${job.seniority || 'unknown'}
+Description: ${job.description || ''}
+Requirements: ${job.requirements || ''}`;
+    return await callClaudeJSON(system, `CANDIDATE:\n${candidateBlock}\n\nROLE:\n${jobBlock}\n\nScore the fit.`, { maxTokens: 800 });
+  }
+
+  async function aiInterviewQuestions(job) {
+    const system = `Generate 7 interview questions for this role. Mix:
+- 2 behavioral (STAR-friendly)
+- 3 role-specific functional/technical
+- 1 problem-solving
+- 1 culture / motivation
+
+For each, include what to look for in a strong answer. Return ONLY valid JSON, no preamble:
+{"questions":[{"question":"...","competency":"<one of: communication, technical, problem-solving, leadership, culture, motivation>","lookFor":"<2 sentences on what a strong answer covers>"}]}`;
+    return await callClaudeJSON(system, `Title: ${job.title}\nSeniority: ${job.seniority || 'unknown'}\nDescription: ${job.description}\nRequirements: ${job.requirements}`, { maxTokens: 1800 });
+  }
+
+  async function aiCandidateSummary({ candidate, applications, jobs }) {
+    const apps = applications.map(a => {
+      const j = jobs.find(x => x.id === a.jobId);
+      return j ? `- ${j.title} (stage: ${a.stage}${a.fitScore ? ', AI fit: ' + a.fitScore : ''})` : null;
+    }).filter(Boolean).join('\n') || 'No active applications.';
+    const system = `Write a concise executive summary of this candidate (~80 words, 1 paragraph) suitable for sharing with a hiring manager. Lead with their strongest fit factor, mention their most relevant experience, and end with one consideration or watch-out. No headers, no markdown, no bullet points — just one tight paragraph.`;
+    const user = `Candidate: ${candidate.name}
+Current: ${candidate.currentRole || 'unknown'} at ${candidate.currentCompany || 'unknown'}
+Experience: ${candidate.yearsExperience || 'unknown'} years
+Skills: ${(candidate.skills || []).join(', ')}
+Summary: ${candidate.summary || ''}
+
+Active applications:
+${apps}`;
+    return await callClaude(system, user, { maxTokens: 400 });
+  }
+
+  // =============================================================================
+  // Seed data — inserted into Supabase the first time a user has zero clients
+  // =============================================================================
+  async function seedDemoDataIntoSupabase() {
+    // 1) clients
+    const clientsPayload = [
+      { name: 'Acme Robotics', industry: 'Hardware / Robotics', color_idx: 0, status: 'active' },
+      { name: 'Bluefin Labs',  industry: 'B2B SaaS',            color_idx: 1, status: 'active' },
+    ];
+    const { data: clients, error: cErr } = await supabase.from('clients').insert(clientsPayload).select();
+    if (cErr) throw new Error('Seeding clients failed: ' + cErr.message);
+    const c1 = clients[0].id, c2 = clients[1].id;
+
+    // 2) jobs
+    const jobsPayload = [
+      { client_id: c1, title: 'Senior Mechanical Engineer', seniority: 'Senior', location: 'Bengaluru, IN', work_mode: 'Hybrid', priority: 'high', status: 'open',
+        description: '## About the role\nLead the mechanical design of our next-gen industrial robotics platform, working closely with controls and software teams to ship production-ready hardware.\n\n## Responsibilities\n- Own the mechanical architecture of key robotic subsystems\n- Drive DFM/DFA reviews with manufacturing partners\n- Run FEA simulations and prototype validation cycles\n- Mentor 2 junior mechanical engineers\n- Partner with the controls team on actuator selection',
+        requirements: '## Must-have\n- 7+ years in mechanical design for production hardware\n- Expert-level SolidWorks; familiarity with FEA tools (ANSYS or similar)\n- Experience taking products from prototype to mass production\n- Strong GD&T fundamentals\n\n## Nice-to-have\n- Robotics or motion-control background\n- DFM experience with Indian or SE Asian manufacturing partners' },
+      { client_id: c1, title: 'Robotics Software Engineer', seniority: 'Mid', location: 'Bengaluru, IN', work_mode: 'Onsite', priority: 'high', status: 'open',
+        description: '## About the role\nBuild perception and motion-planning software for our industrial robots. You\'ll own modules used in production lines across India.\n\n## Responsibilities\n- Develop motion planning and trajectory optimization in C++\n- Integrate sensor inputs (depth cameras, IMUs) into perception pipelines\n- Tune controllers in close partnership with mechanical and EE teams\n- Contribute to the company\'s open-source robotics tooling',
+        requirements: '## Must-have\n- 3+ years in robotics, autonomous systems, or motion control\n- Strong C++ and Python\n- ROS / ROS 2 in production\n- BS/MS in CS, Robotics, or related field\n\n## Nice-to-have\n- Experience with industrial manipulators\n- Computer vision / point-cloud processing' },
+      { client_id: c2, title: 'Founding Product Designer', seniority: 'Senior', location: 'Remote (IST overlap)', work_mode: 'Remote', priority: 'medium', status: 'open',
+        description: '## About the role\nOwn the end-to-end product experience as our first design hire. You\'ll define the design system, run user research, and ship the next chapter of the product.\n\n## Responsibilities\n- Define and own the product design language and system\n- Run weekly user-research sessions with our SMB customers\n- Collaborate directly with the founders on product strategy\n- Build a design hiring rubric for the next 2 design hires',
+        requirements: '## Must-have\n- 6+ years designing B2B SaaS products\n- Track record shipping 0-to-1 features that customers actually use\n- Figma fluency, including building design systems\n- Strong written communication\n\n## Nice-to-have\n- Experience at a sub-50-person startup\n- Prior founding-designer or design-lead role' },
+    ];
+    const { data: jobs, error: jErr } = await supabase.from('jobs').insert(jobsPayload).select();
+    if (jErr) throw new Error('Seeding jobs failed: ' + jErr.message);
+    const j1 = jobs[0].id, j2 = jobs[1].id, j3 = jobs[2].id;
+
+    // 3) candidates
+    const candidatesPayload = [
+      { name: 'Priya Sharma', email: 'priya.s@example.com', phone: '+91 98765 43210',
+        current_title: 'Senior Mechanical Engineer', current_company: 'TVS Motor', years_experience: 8,
+        skills: ['SolidWorks', 'FEA / ANSYS', 'GD&T', 'DFM', 'Manufacturing'],
+        summary: 'Mechanical engineer with 8 years in two-wheeler and EV component design. Has shipped two products from concept to mass production at scale. Looking for a more end-to-end ownership role.',
+        source: 'LinkedIn' },
+      { name: 'Arjun Nair', email: 'arjun.n@example.com', phone: '+91 99876 54321',
+        current_title: 'Robotics Engineer', current_company: 'Boston Dynamics India', years_experience: 4,
+        skills: ['C++', 'ROS 2', 'Python', 'Motion Planning', 'Computer Vision'],
+        summary: 'Robotics engineer specializing in motion planning and perception. MS in Robotics from IIT-Madras. Co-author on two ICRA papers.',
+        source: 'Referral · Pratik G.' },
+      { name: 'Sara Kapoor', email: 'sara.k@example.com', phone: '+91 91234 56789',
+        current_title: 'Senior Product Designer', current_company: 'Razorpay', years_experience: 6,
+        skills: ['Figma', 'Design Systems', 'B2B SaaS', 'User Research', 'Prototyping'],
+        summary: 'Senior designer with deep B2B SaaS chops at Razorpay; built and maintained their design system. Looking for a smaller-team, founding-designer role with more strategic ownership.',
+        source: 'Inbound' },
+      { name: 'Rohan Mehta', email: 'rohan.m@example.com', phone: '+91 90011 22334',
+        current_title: 'Mechanical Designer', current_company: 'Mahindra Electric', years_experience: 5,
+        skills: ['SolidWorks', 'CATIA', 'GD&T', 'Manufacturing'],
+        summary: 'Mechanical designer at Mahindra working on EV battery enclosures. 5 years experience, primarily in CAD and DFM.',
+        source: 'LinkedIn' },
+    ];
+    const { data: candidates, error: kErr } = await supabase.from('candidates').insert(candidatesPayload).select();
+    if (kErr) throw new Error('Seeding candidates failed: ' + kErr.message);
+    const k1 = candidates[0].id, k2 = candidates[1].id, k3 = candidates[2].id, k4 = candidates[3].id;
+
+    // 4) applications
+    const applicationsPayload = [
+      { candidate_id: k1, job_id: j1, stage: 'interview',  strengths: [], gaps: [] },
+      { candidate_id: k4, job_id: j1, stage: 'screening',  strengths: [], gaps: [] },
+      { candidate_id: k2, job_id: j2, stage: 'screening',  strengths: [], gaps: [] },
+      { candidate_id: k3, job_id: j3, stage: 'offer',      strengths: [], gaps: [] },
+    ];
+    const { error: aErr } = await supabase.from('applications').insert(applicationsPayload);
+    if (aErr) throw new Error('Seeding applications failed: ' + aErr.message);
+  }
+
+  async function loadOrSeedData() {
+    let data = await fetchAllData();
+    if (data.clients.length === 0 && data.jobs.length === 0 && data.candidates.length === 0) {
+      await seedDemoDataIntoSupabase();
+      data = await fetchAllData();
+    }
+    return data;
+  }
+
+  // =============================================================================
+  // Auth handlers — Supabase Auth
+  // =============================================================================
+  async function handleSignup(formEl) {
+    if (state.submitting) return;
+    const fd = new FormData(formEl);
+    const name = (fd.get('name')||'').toString().trim();
+    const email = (fd.get('email')||'').toString().trim().toLowerCase();
+    const password = (fd.get('password')||'').toString();
+    const confirm = (fd.get('confirm')||'').toString();
+
+    if (!name || name.length < 2) return showAuthErr('Please enter your full name.');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showAuthErr('Please enter a valid email.');
+    if (password.length < 8) return showAuthErr('Password must be at least 8 characters.');
+    if (password !== confirm) return showAuthErr('Passwords do not match.');
+
+    state.submitting = true; state.error = null; render();
+
+    const { data, error } = await supabase.auth.signUp({
+      email, password,
+      options: { data: { name } },
+    });
+    if (error) { state.submitting = false; return showAuthErr(error.message); }
+
+    // If email confirmation is OFF in Supabase, we'll have a session immediately.
+    // If it's ON, the user has to click the email link — show them a message.
+    if (!data.session) {
+      state.submitting = false;
+      state.error = null;
+      state.info = 'Almost there — check your inbox for a confirmation link, then sign in.';
+      state.view = 'login';
+      render();
+      return;
+    }
+
+    state.user = { id: data.user.id, email: data.user.email, name };
+    try {
+      state.data = await loadOrSeedData();
+    } catch (e) {
+      state.submitting = false;
+      return showAuthErr('Sign-up succeeded, but loading workspace failed: ' + e.message);
+    }
+    state.activeClientId = null;
+    state.view = 'dashboard';
+    state.submitting = false;
+    state.error = null;
+    state.info = `Welcome, ${name.split(' ')[0]}! We've seeded your workspace with demo clients to explore.`;
+    render();
+  }
+
+  async function handleLogin(formEl) {
+    if (state.submitting) return;
+    const fd = new FormData(formEl);
+    const email = (fd.get('email')||'').toString().trim().toLowerCase();
+    const password = (fd.get('password')||'').toString();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return showAuthErr('Please enter a valid email.');
+    if (!password) return showAuthErr('Please enter your password.');
+
+    state.submitting = true; state.error = null; render();
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) { state.submitting = false; return showAuthErr(error.message); }
+
+    state.user = {
+      id: data.user.id,
+      email: data.user.email,
+      name: data.user.user_metadata?.name || data.user.email.split('@')[0],
+    };
+    try {
+      state.data = await loadOrSeedData();
+    } catch (e) {
+      state.submitting = false;
+      return showAuthErr('Sign-in succeeded, but loading workspace failed: ' + e.message);
+    }
+    state.activeClientId = null;
+    state.view = 'dashboard';
+    state.submitting = false;
+    state.error = null;
+    state.info = `Welcome back, ${state.user.name.split(' ')[0]}.`;
+    render();
+  }
+
+  async function handleSignout() {
+    await supabase.auth.signOut();
+    state.user = null;
+    state.data = { clients: [], jobs: [], candidates: [], applications: [] };
+    state.activeClientId = null;
+    state.view = 'login';
+    state.error = null;
+    state.info = 'Signed out.';
+    render();
+  }
+
+  function showAuthErr(msg) { state.error = msg; state.info = null; render(); }
+
+  // =============================================================================
+  // Navigation
+  // =============================================================================
+  function go(view, params = {}) {
+    state.view = view;
+    state.params = params;
+    state.error = null;
+    state.info = null;
+    window.scrollTo(0, 0);
+    render();
+  }
+
+  // =============================================================================
+  // Mutations — write to Supabase, then update local state from returned row
+  // =============================================================================
+  async function createClient({ name, industry }) {
+    const colorIdx = state.data.clients.length % CLIENT_COLORS.length;
+    const { data, error } = await supabase.from('clients').insert({
+      name, industry, color_idx: colorIdx, status: 'active',
+    }).select().single();
+    if (error) { toast('Create client failed: ' + error.message, 'error'); return null; }
+    const c = rowToClient(data);
+    state.data.clients.unshift(c);
+    return c;
+  }
+
+  async function createJob(payload) {
+    const row = {
+      client_id: payload.clientId,
+      title: payload.title,
+      seniority: payload.seniority || null,
+      location: payload.location || null,
+      work_mode: payload.workMode || null,
+      priority: payload.priority || 'medium',
+      status: payload.status || 'open',
+      description: payload.description || '',
+      requirements: payload.requirements || '',
+    };
+    const { data, error } = await supabase.from('jobs').insert(row).select().single();
+    if (error) { toast('Create job failed: ' + error.message, 'error'); return null; }
+    const j = rowToJob(data);
+    state.data.jobs.unshift(j);
+    return j;
+  }
+
+  async function updateJob(jobId, patch) {
+    const row = {};
+    if (patch.title != null) row.title = patch.title;
+    if (patch.seniority != null) row.seniority = patch.seniority;
+    if (patch.location != null) row.location = patch.location;
+    if (patch.workMode != null) row.work_mode = patch.workMode;
+    if (patch.priority != null) row.priority = patch.priority;
+    if (patch.status != null) row.status = patch.status;
+    if (patch.description != null) row.description = patch.description;
+    if (patch.requirements != null) row.requirements = patch.requirements;
+    const { data, error } = await supabase.from('jobs').update(row).eq('id', jobId).select().single();
+    if (error) { toast('Update job failed: ' + error.message, 'error'); return; }
+    const idx = state.data.jobs.findIndex(j => j.id === jobId);
+    if (idx >= 0) state.data.jobs[idx] = rowToJob(data);
+  }
+
+  async function deleteJob(jobId) {
+    const { error } = await supabase.from('jobs').delete().eq('id', jobId);
+    if (error) { toast('Delete failed: ' + error.message, 'error'); return; }
+    state.data.jobs = state.data.jobs.filter(j => j.id !== jobId);
+    state.data.applications = state.data.applications.filter(a => a.jobId !== jobId);
+  }
+
+  async function createCandidate(payload) {
+    const row = {
+      name: payload.name,
+      email: payload.email || null,
+      phone: payload.phone || null,
+      current_title: payload.currentRole || null,
+      current_company: payload.currentCompany || null,
+      years_experience: payload.yearsExperience ?? null,
+      skills: payload.skills || [],
+      summary: payload.summary || null,
+      source: payload.source || null,
+    };
+    const { data, error } = await supabase.from('candidates').insert(row).select().single();
+    if (error) { toast('Create candidate failed: ' + error.message, 'error'); return null; }
+    const k = rowToCandidate(data);
+    state.data.candidates.unshift(k);
+    return k;
+  }
+
+  async function updateCandidate(candidateId, patch) {
+    const row = {};
+    if (patch.name != null) row.name = patch.name;
+    if (patch.email != null) row.email = patch.email;
+    if (patch.phone != null) row.phone = patch.phone;
+    if (patch.currentRole != null) row.current_title = patch.currentRole;
+    if (patch.currentCompany != null) row.current_company = patch.currentCompany;
+    if (patch.yearsExperience !== undefined) row.years_experience = patch.yearsExperience;
+    if (patch.skills != null) row.skills = patch.skills;
+    if (patch.summary != null) row.summary = patch.summary;
+    if (patch.source != null) row.source = patch.source;
+    if (patch.aiSummary !== undefined) row.ai_summary = patch.aiSummary;
+    const { data, error } = await supabase.from('candidates').update(row).eq('id', candidateId).select().single();
+    if (error) { toast('Update candidate failed: ' + error.message, 'error'); return; }
+    const idx = state.data.candidates.findIndex(c => c.id === candidateId);
+    if (idx >= 0) state.data.candidates[idx] = rowToCandidate(data);
+  }
+
+  async function deleteCandidate(candidateId) {
+    const { error } = await supabase.from('candidates').delete().eq('id', candidateId);
+    if (error) { toast('Delete failed: ' + error.message, 'error'); return; }
+    state.data.candidates = state.data.candidates.filter(c => c.id !== candidateId);
+    state.data.applications = state.data.applications.filter(a => a.candidateId !== candidateId);
+  }
+
+  async function createApplication(candidateId, jobId) {
+    const exists = state.data.applications.find(a => a.candidateId === candidateId && a.jobId === jobId);
+    if (exists) return exists;
+    const { data, error } = await supabase.from('applications').insert({
+      candidate_id: candidateId, job_id: jobId, stage: 'applied', strengths: [], gaps: [],
+    }).select().single();
+    if (error) { toast('Add application failed: ' + error.message, 'error'); return null; }
+    const a = rowToApplication(data);
+    state.data.applications.unshift(a);
+    return a;
+  }
+
+  async function updateApplication(appId, patch) {
+    const row = {};
+    if (patch.stage != null) row.stage = patch.stage;
+    if (patch.fitScore !== undefined) row.fit_score = patch.fitScore;
+    if (patch.fitSummary !== undefined) row.fit_summary = patch.fitSummary;
+    if (patch.strengths != null) row.strengths = patch.strengths;
+    if (patch.gaps != null) row.gaps = patch.gaps;
+    const { data, error } = await supabase.from('applications').update(row).eq('id', appId).select().single();
+    if (error) { toast('Update failed: ' + error.message, 'error'); return; }
+    const idx = state.data.applications.findIndex(a => a.id === appId);
+    if (idx >= 0) state.data.applications[idx] = rowToApplication(data);
+  }
+
+  // =============================================================================
+  // Selectors
+  // =============================================================================
+  function clientById(cid) { return state.data.clients.find(c => c.id === cid); }
+  function jobById(jid)    { return state.data.jobs.find(j => j.id === jid); }
+  function candidateById(kid) { return state.data.candidates.find(c => c.id === kid); }
+
+  function visibleJobs() {
+    if (!state.activeClientId) return state.data.jobs;
+    return state.data.jobs.filter(j => j.clientId === state.activeClientId);
+  }
+  function applicationsForJob(jobId) {
+    return state.data.applications.filter(a => a.jobId === jobId);
+  }
+  function applicationsForCandidate(candidateId) {
+    return state.data.applications.filter(a => a.candidateId === candidateId);
+  }
+
+  // =============================================================================
+  // Common render bits
+  // =============================================================================
+  function logoMark(size = 32) {
+    return `<span class="grid place-items-center rounded-md bg-brand-600 text-white" style="height:${size}px;width:${size}px">
+      <svg viewBox="0 0 24 24" width="${Math.round(size*0.55)}" height="${Math.round(size*0.55)}" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+      </svg>
+    </span>`;
+  }
+
+  function spinner(cls = 'h-4 w-4') {
+    return `<svg class="${cls} animate-spin" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity=".25" stroke-width="4"/>
+      <path d="M4 12a8 8 0 0 1 8-8" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+    </svg>`;
+  }
+
+  function clientChip(client) {
+    if (!client) return '';
+    const dot = CLIENT_COLORS[client.colorIdx % CLIENT_COLORS.length];
+    return `<span class="inline-flex items-center gap-1.5 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
+      <span class="${dot} h-2 w-2 rounded-full"></span>${escapeHTML(client.name)}
+    </span>`;
+  }
+
+  function fitScorePill(score) {
+    if (score == null) return `<span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">No fit score</span>`;
+    const cls = score >= 80 ? 'bg-emerald-100 text-emerald-700'
+              : score >= 60 ? 'bg-blue-100 text-blue-700'
+              : score >= 40 ? 'bg-amber-100 text-amber-700'
+              : 'bg-rose-100 text-rose-700';
+    return `<span class="inline-flex items-center gap-1 rounded-full ${cls} px-2 py-0.5 text-xs font-semibold tabular-nums">
+      <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15 8.5 22 9.3 17 14 18.5 21 12 17.8 5.5 21 7 14 2 9.3 9 8.5"/></svg>
+      ${score}
+    </span>`;
+  }
+
+  function bannerHTML() {
+    if (state.error) return `<div role="alert" class="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">${escapeHTML(state.error)}</div>`;
+    if (state.info)  return `<div role="status" class="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">${escapeHTML(state.info)}</div>`;
+    return '';
+  }
+
+  // =============================================================================
+  // App shell (header + sidebar)
+  // =============================================================================
+  function renderShell(content) {
+    const u = state.user || {};
+    const active = state.activeClientId ? clientById(state.activeClientId) : null;
+    const navItems = [
+      { view: 'dashboard',  label: 'Dashboard',  icon: 'M3 12l9-9 9 9 M5 10v10a1 1 0 0 0 1 1h3v-7h6v7h3a1 1 0 0 0 1-1V10' },
+      { view: 'jobs',       label: 'Jobs',       icon: 'M20 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16' },
+      { view: 'candidates', label: 'Candidates', icon: 'M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75 M8.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z' },
+      { view: 'clients',    label: 'Clients',    icon: 'M3 21h18 M5 21V7l8-4v18 M19 21V11l-6-4' },
+    ];
+    const isActiveView = (v) => state.view === v ||
+      (v === 'jobs' && (state.view === 'jobNew' || state.view === 'jobDetail')) ||
+      (v === 'candidates' && (state.view === 'candidateNew' || state.view === 'candidateDetail')) ||
+      (v === 'clients' && state.view === 'clientNew');
+
+    const dotColor = (c) => c ? CLIENT_COLORS[c.colorIdx % CLIENT_COLORS.length] : '';
+
+    return `
+      <div class="flex min-h-screen">
+        <!-- Sidebar -->
+        <aside class="hidden w-60 shrink-0 flex-col border-r border-slate-200 bg-white md:flex">
+          <a href="#" data-action="go" data-view="dashboard" class="flex items-center gap-2 px-5 py-4 transition hover:opacity-90">
+            ${logoMark(30)}
+            <span class="text-base font-semibold tracking-tight">HRForge</span>
+          </a>
+          <nav class="flex-1 px-3 pb-4">
+            <p class="px-3 pb-1 text-xs font-semibold uppercase tracking-wider text-slate-400">Workspace</p>
+            ${navItems.map(item => `
+              <a href="#" data-action="go" data-view="${item.view}"
+                class="mt-1 flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition ${
+                  isActiveView(item.view)
+                    ? 'bg-brand-50 text-brand-700'
+                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><path d="${item.icon}"/></svg>
+                ${item.label}
+              </a>`).join('')}
+          </nav>
+          <div class="border-t border-slate-100 px-3 py-3">
+            <button data-action="signout" class="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-50 hover:text-slate-900">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+              Sign out
+            </button>
+          </div>
+        </aside>
+
+        <div class="flex min-w-0 flex-1 flex-col">
+          <!-- Top bar -->
+          <header class="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-slate-200 bg-white/85 px-4 backdrop-blur md:px-6">
+            <!-- Client switcher -->
+            <div class="relative">
+              <button data-action="toggle-client-switcher"
+                class="inline-flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium hover:bg-slate-50">
+                ${active ? `<span class="${dotColor(active)} h-2 w-2 rounded-full"></span>${escapeHTML(active.name)}` : `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>All clients`}
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+              <div id="client-switcher" class="absolute left-0 top-full mt-1 hidden w-64 rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                <div class="px-3 py-1 text-xs font-semibold uppercase tracking-wider text-slate-400">Switch workspace</div>
+                <button data-action="set-client" data-client="" class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-50">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/></svg>
+                  All clients
+                </button>
+                ${state.data.clients.length > 0 ? '<div class="my-1 border-t border-slate-100"></div>' : ''}
+                ${state.data.clients.map(c => `
+                  <button data-action="set-client" data-client="${c.id}" class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-50">
+                    <span class="${CLIENT_COLORS[c.colorIdx % CLIENT_COLORS.length]} h-2 w-2 rounded-full"></span>
+                    <span class="truncate">${escapeHTML(c.name)}</span>
+                  </button>`).join('')}
+                ${state.data.clients.length === 0 ? '<div class="px-3 py-2 text-xs text-slate-500">No clients yet.</div>' : ''}
+              </div>
+            </div>
+
+            <div class="ml-auto flex items-center gap-2">
+              <span aria-hidden class="grid h-9 w-9 place-items-center rounded-full bg-brand-100 text-sm font-semibold text-brand-700">${escapeHTML(initials(u.name))}</span>
+              <div class="hidden text-right sm:block">
+                <p class="text-xs font-medium leading-tight">${escapeHTML(u.name || '')}</p>
+                <p class="text-[11px] leading-tight text-slate-500">${escapeHTML(u.email || '')}</p>
+              </div>
+            </div>
+          </header>
+
+          <main class="flex-1 overflow-y-auto">
+            ${content}
+          </main>
+        </div>
+      </div>
+    `;
+  }
+
+  // =============================================================================
+  // Auth screens
+  // =============================================================================
+  function renderAuthShell(inner) {
+    return `
+      <div class="auth-bg flex min-h-screen items-center justify-center px-4 py-10">
+        <div class="w-full max-w-sm fade-in">
+          <a href="#" data-action="go" data-view="login" class="mb-8 flex items-center justify-center gap-2 hover:opacity-90">
+            ${logoMark(36)}<span class="text-lg font-semibold tracking-tight">HRForge</span>
+          </a>
+          ${inner}
+          <p class="mt-6 text-center text-[11px] text-slate-500">Demo · Accounts and data stored locally in this artifact.</p>
+        </div>
+      </div>`;
+  }
+
+  function renderLogin() {
+    return renderAuthShell(`
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="mb-5">
+          <h1 class="text-xl font-semibold tracking-tight">Welcome back</h1>
+          <p class="mt-1 text-sm text-slate-500">Sign in to your hiring workspace.</p>
+        </div>
+        <form id="login-form" class="space-y-4" novalidate>
+          <div>
+            <label for="email" class="mb-1.5 block text-sm font-medium">Email</label>
+            <input id="email" name="email" type="email" autocomplete="email" required class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" placeholder="you@company.com" />
+          </div>
+          <div>
+            <label for="password" class="mb-1.5 block text-sm font-medium">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+          </div>
+          ${bannerHTML()}
+          <button type="submit" class="inline-flex w-full items-center justify-center rounded-md bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-brand-700 disabled:opacity-60" ${state.submitting?'disabled':''}>
+            ${state.submitting ? spinner('h-4 w-4 mr-2') : ''}${state.submitting ? 'Signing in…' : 'Sign in'}
+          </button>
+        </form>
+        <p class="mt-5 text-center text-sm text-slate-600">New here? <a href="#" data-action="go" data-view="signup" class="font-medium text-brand-600 hover:text-brand-700">Create an account</a></p>
+      </div>`);
+  }
+
+  function renderSignup() {
+    return renderAuthShell(`
+      <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="mb-5">
+          <h1 class="text-xl font-semibold tracking-tight">Create your account</h1>
+          <p class="mt-1 text-sm text-slate-500">A workspace, seeded with demo data, in 5 seconds.</p>
+        </div>
+        <form id="signup-form" class="space-y-4" novalidate>
+          <div>
+            <label for="name" class="mb-1.5 block text-sm font-medium">Full name</label>
+            <input id="name" name="name" type="text" autocomplete="name" required minlength="2" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+          </div>
+          <div>
+            <label for="email" class="mb-1.5 block text-sm font-medium">Email</label>
+            <input id="email" name="email" type="email" autocomplete="email" required class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+          </div>
+          <div>
+            <label for="password" class="mb-1.5 block text-sm font-medium">Password</label>
+            <input id="password" name="password" type="password" autocomplete="new-password" required minlength="8" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            <p class="mt-1 text-xs text-slate-500">At least 8 characters.</p>
+          </div>
+          <div>
+            <label for="confirm" class="mb-1.5 block text-sm font-medium">Confirm password</label>
+            <input id="confirm" name="confirm" type="password" autocomplete="new-password" required minlength="8" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+          </div>
+          ${bannerHTML()}
+          <button type="submit" class="inline-flex w-full items-center justify-center rounded-md bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-brand-700 disabled:opacity-60" ${state.submitting?'disabled':''}>
+            ${state.submitting ? spinner('h-4 w-4 mr-2') : ''}${state.submitting ? 'Creating…' : 'Create account'}
+          </button>
+        </form>
+        <p class="mt-5 text-center text-sm text-slate-600">Have an account? <a href="#" data-action="go" data-view="login" class="font-medium text-brand-600 hover:text-brand-700">Sign in</a></p>
+      </div>`);
+  }
+
+  // =============================================================================
+  // Dashboard
+  // =============================================================================
+  function renderDashboard() {
+    const u = state.user || {};
+    const firstName = (u.name || '').split(' ')[0] || 'there';
+    const jobs = visibleJobs();
+    const openJobs = jobs.filter(j => j.status === 'open');
+    const allApps = state.data.applications.filter(a => jobs.some(j => j.id === a.jobId));
+    const stageCounts = STAGES.map(s => ({ ...s, count: allApps.filter(a => a.stage === s.id).length }));
+    const totalActive = allApps.filter(a => !['hired','rejected'].includes(a.stage)).length;
+    const hiredThisMonth = allApps.filter(a => a.stage === 'hired' && a.createdAt > Date.now() - 30*86400000).length;
+    const hiPriority = openJobs.filter(j => j.priority === 'high').length;
+
+    const recentApps = [...allApps].sort((a,b) => b.createdAt - a.createdAt).slice(0, 6);
+
+    const tiles = [
+      { label:'Open requisitions', value: openJobs.length, sub:`${hiPriority} high priority`,
+        iconCls:'bg-amber-100 text-amber-700',
+        icon:'M20 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16' },
+      { label:'Active candidates', value: totalActive, sub:'In pipeline now',
+        iconCls:'bg-blue-100 text-blue-700',
+        icon:'M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75 M8.5 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z' },
+      { label:'Hired (30d)', value: hiredThisMonth, sub:'Closed in this period',
+        iconCls:'bg-emerald-100 text-emerald-700',
+        icon:'M22 11.08V12a10 10 0 1 1-5.93-9.14 M22 4 12 14.01l-3-3' },
+      { label:'Active clients', value: state.data.clients.filter(c => c.status === 'active').length, sub:'In your portfolio',
+        iconCls:'bg-purple-100 text-purple-700',
+        icon:'M3 21h18 M5 21V7l8-4v18 M19 21V11l-6-4' },
+    ];
+
+    return renderShell(`
+      <div class="mx-auto max-w-6xl px-4 py-8 md:px-6 md:py-10">
+        ${state.info ? `<div class="mb-6 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">${escapeHTML(state.info)}</div>` : ''}
+
+        <header class="mb-8 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div>
+            <p class="font-mono text-xs uppercase tracking-wider text-slate-500">${state.activeClientId ? escapeHTML(clientById(state.activeClientId)?.name || '') : 'Portfolio view'}</p>
+            <h1 class="mt-1 text-2xl font-semibold tracking-tight md:text-3xl">Hello, ${escapeHTML(firstName)}.</h1>
+            <p class="mt-1 text-sm text-slate-600">Here's the state of your hiring funnel.</p>
+          </div>
+          <div class="flex gap-2">
+            <button data-action="go" data-view="jobNew" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              New job
+            </button>
+            <button data-action="go" data-view="candidateNew" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+              Add candidate
+            </button>
+          </div>
+        </header>
+
+        <section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          ${tiles.map(t => `
+            <article class="rounded-lg border border-slate-200 bg-white p-5 transition hover:border-brand-200">
+              <div class="flex items-center justify-between">
+                <span class="grid h-9 w-9 place-items-center rounded-md ${t.iconCls}">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden><path d="${t.icon}"/></svg>
+                </span>
+              </div>
+              <p class="mt-3 text-3xl font-semibold tabular-nums tracking-tight">${t.value}</p>
+              <p class="mt-1 text-sm font-medium text-slate-700">${t.label}</p>
+              <p class="mt-1 text-xs text-slate-500">${t.sub}</p>
+            </article>`).join('')}
+        </section>
+
+        <!-- Pipeline distribution -->
+        <section class="mt-8 rounded-lg border border-slate-200 bg-white p-6">
+          <div class="mb-4 flex items-center justify-between">
+            <h2 class="text-sm font-semibold">Pipeline by stage</h2>
+            ${allApps.length === 0 ? '' : `<span class="text-xs text-slate-500">${allApps.length} total applications</span>`}
+          </div>
+          ${allApps.length === 0 ? `
+            <div class="py-8 text-center text-sm text-slate-500">No applications yet. <a href="#" data-action="go" data-view="jobs" class="font-medium text-brand-600">Open a job</a> to get started.</div>
+          ` : `
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+              ${stageCounts.map(s => `
+                <div class="rounded-md border ${s.color.split(' ').filter(c => c.startsWith('border')).join(' ') || 'border-slate-200'} ${s.color.replace(/text-\S+|border-\S+/g,'').trim()} p-3">
+                  <p class="text-xs font-medium uppercase tracking-wider opacity-70">${s.name}</p>
+                  <p class="mt-1 text-2xl font-semibold tabular-nums ${s.color.split(' ').find(c => c.startsWith('text-')) || ''}">${s.count}</p>
+                </div>`).join('')}
+            </div>
+          `}
+        </section>
+
+        <!-- Two column: open jobs + recent activity -->
+        <section class="mt-8 grid gap-6 lg:grid-cols-2">
+          <article class="rounded-lg border border-slate-200 bg-white p-6">
+            <div class="mb-4 flex items-center justify-between">
+              <h2 class="text-sm font-semibold">Open requisitions</h2>
+              <a href="#" data-action="go" data-view="jobs" class="text-xs font-medium text-brand-600 hover:text-brand-700">View all</a>
+            </div>
+            ${openJobs.length === 0 ? `
+              <p class="py-6 text-center text-sm text-slate-500">No open requisitions${state.activeClientId ? ' for this client' : ''}.</p>
+            ` : `
+              <ul class="divide-y divide-slate-100">
+                ${openJobs.slice(0, 5).map(j => {
+                  const client = clientById(j.clientId);
+                  const apps = applicationsForJob(j.id);
+                  return `
+                    <li class="py-3">
+                      <a href="#" data-action="go" data-view="jobDetail" data-job="${j.id}" class="group flex items-start gap-3 -m-1 rounded-md p-1 hover:bg-slate-50">
+                        <span class="mt-1 grid h-8 w-8 place-items-center rounded-md bg-slate-100 text-slate-500"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></span>
+                        <div class="min-w-0 flex-1">
+                          <p class="truncate text-sm font-medium text-slate-900 group-hover:text-brand-700">${escapeHTML(j.title)}</p>
+                          <div class="mt-0.5 flex flex-wrap items-center gap-2">
+                            ${client ? clientChip(client) : ''}
+                            <span class="text-xs text-slate-500">${apps.length} candidate${apps.length===1?'':'s'}</span>
+                            ${j.priority === 'high' ? '<span class="rounded-full bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-rose-700">High</span>' : ''}
+                          </div>
+                        </div>
+                      </a>
+                    </li>`;
+                }).join('')}
+              </ul>
+            `}
+          </article>
+
+          <article class="rounded-lg border border-slate-200 bg-white p-6">
+            <div class="mb-4 flex items-center justify-between">
+              <h2 class="text-sm font-semibold">Recent applications</h2>
+            </div>
+            ${recentApps.length === 0 ? `
+              <p class="py-6 text-center text-sm text-slate-500">No applications yet.</p>
+            ` : `
+              <ul class="divide-y divide-slate-100">
+                ${recentApps.map(a => {
+                  const k = candidateById(a.candidateId);
+                  const j = jobById(a.jobId);
+                  if (!k || !j) return '';
+                  const stage = STAGE_BY_ID[a.stage];
+                  return `
+                    <li class="py-3">
+                      <a href="#" data-action="go" data-view="candidateDetail" data-candidate="${k.id}" class="group -m-1 flex items-start gap-3 rounded-md p-1 hover:bg-slate-50">
+                        <span class="mt-0.5 grid h-8 w-8 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600">${escapeHTML(initials(k.name))}</span>
+                        <div class="min-w-0 flex-1">
+                          <p class="truncate text-sm"><span class="font-medium text-slate-900 group-hover:text-brand-700">${escapeHTML(k.name)}</span> <span class="text-slate-500">→ ${escapeHTML(j.title)}</span></p>
+                          <div class="mt-0.5 flex items-center gap-2">
+                            <span class="rounded-full ${stage.color} border px-2 py-0.5 text-[10px] font-medium">${stage.name}</span>
+                            ${fitScorePill(a.fitScore)}
+                          </div>
+                        </div>
+                        <span class="shrink-0 text-xs text-slate-500">${fmtRel(a.createdAt)}</span>
+                      </a>
+                    </li>`;
+                }).join('')}
+              </ul>
+            `}
+          </article>
+        </section>
+
+        <p class="mt-10 text-center text-[11px] text-slate-400">HRForge demo · AI features call the Claude API in real time.</p>
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Jobs list
+  // =============================================================================
+  function renderJobs() {
+    const jobs = visibleJobs();
+    const groups = state.activeClientId
+      ? [{ client: clientById(state.activeClientId), jobs }]
+      : state.data.clients.map(c => ({ client: c, jobs: jobs.filter(j => j.clientId === c.id) })).filter(g => g.jobs.length > 0);
+
+    return renderShell(`
+      <div class="mx-auto max-w-6xl px-4 py-8 md:px-6 md:py-10">
+        <header class="mb-6 flex items-end justify-between">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">Jobs</h1>
+            <p class="mt-1 text-sm text-slate-600">${jobs.length} role${jobs.length===1?'':'s'} ${state.activeClientId ? 'for this client' : 'across all clients'}.</p>
+          </div>
+          <button data-action="go" data-view="jobNew" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New job
+          </button>
+        </header>
+
+        ${jobs.length === 0 ? `
+          <div class="rounded-lg border border-dashed border-slate-300 bg-white p-12 text-center">
+            <p class="text-sm font-medium">No jobs yet.</p>
+            <p class="mt-1 text-sm text-slate-500">Create your first job to start tracking candidates.</p>
+            <button data-action="go" data-view="jobNew" class="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+              + Create job
+            </button>
+          </div>
+        ` : groups.map(g => `
+          <section class="mb-8">
+            ${!state.activeClientId && g.client ? `
+              <div class="mb-3 flex items-center gap-2">
+                <span class="${CLIENT_COLORS[g.client.colorIdx % CLIENT_COLORS.length]} h-2 w-2 rounded-full"></span>
+                <h2 class="text-sm font-semibold">${escapeHTML(g.client.name)}</h2>
+                <span class="text-xs text-slate-500">· ${escapeHTML(g.client.industry || '')}</span>
+              </div>` : ''}
+            <div class="overflow-hidden rounded-lg border border-slate-200 bg-white">
+              <table class="w-full text-left">
+                <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <tr>
+                    <th class="px-4 py-2.5">Role</th>
+                    <th class="px-4 py-2.5">Status</th>
+                    <th class="px-4 py-2.5">Candidates</th>
+                    <th class="px-4 py-2.5">Posted</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                  ${g.jobs.map(j => {
+                    const apps = applicationsForJob(j.id);
+                    const statusCls = j.status === 'open' ? 'bg-emerald-50 text-emerald-700' : j.status === 'on_hold' ? 'bg-amber-50 text-amber-700' : 'bg-slate-50 text-slate-700';
+                    return `
+                      <tr class="hover:bg-slate-50">
+                        <td class="px-4 py-3">
+                          <a href="#" data-action="go" data-view="jobDetail" data-job="${j.id}" class="block">
+                            <p class="font-medium text-slate-900">${escapeHTML(j.title)}</p>
+                            <p class="mt-0.5 text-xs text-slate-500">${escapeHTML(j.seniority || '')} · ${escapeHTML(j.location || '')} · ${escapeHTML(j.workMode || '')}</p>
+                          </a>
+                        </td>
+                        <td class="px-4 py-3"><span class="inline-flex rounded-full ${statusCls} px-2 py-0.5 text-xs font-medium">${escapeHTML(j.status||'')}</span></td>
+                        <td class="px-4 py-3 text-sm tabular-nums">${apps.length}</td>
+                        <td class="px-4 py-3 text-sm text-slate-500">${fmtRel(j.createdAt)}</td>
+                      </tr>`;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        `).join('')}
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Job — new
+  // =============================================================================
+  function renderJobNew() {
+    const clients = state.data.clients;
+    const draft = state.params.draft || {};
+    const clientId = draft.clientId || state.activeClientId || clients[0]?.id || '';
+    return renderShell(`
+      <div class="mx-auto max-w-3xl px-4 py-8 md:px-6 md:py-10">
+        <header class="mb-6">
+          <button data-action="go" data-view="jobs" class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900">
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg> Back to jobs
+          </button>
+          <h1 class="text-2xl font-semibold tracking-tight">New job</h1>
+          <p class="mt-1 text-sm text-slate-600">Fill in the basics, or use AI to draft the JD from a brief.</p>
+        </header>
+
+        ${clients.length === 0 ? `
+          <div class="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+            You need to add a client first. <a href="#" data-action="go" data-view="clientNew" class="font-medium underline">Add a client</a>.
+          </div>
+        ` : `
+        <form id="job-form" class="space-y-6 rounded-lg border border-slate-200 bg-white p-6">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div class="sm:col-span-2">
+              <label for="title" class="mb-1.5 block text-sm font-medium">Job title <span class="text-red-500">*</span></label>
+              <input id="title" name="title" type="text" required value="${escapeHTML(draft.title || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" placeholder="e.g. Senior Mechanical Engineer" />
+            </div>
+            <div>
+              <label for="clientId" class="mb-1.5 block text-sm font-medium">Client <span class="text-red-500">*</span></label>
+              <select id="clientId" name="clientId" required class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">
+                ${clients.map(c => `<option value="${c.id}" ${c.id===clientId?'selected':''}>${escapeHTML(c.name)}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="seniority" class="mb-1.5 block text-sm font-medium">Seniority</label>
+              <select id="seniority" name="seniority" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">
+                ${['Entry','Junior','Mid','Senior','Lead','Principal','Director'].map(s => `<option ${draft.seniority===s?'selected':''}>${s}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="location" class="mb-1.5 block text-sm font-medium">Location</label>
+              <input id="location" name="location" type="text" value="${escapeHTML(draft.location || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" placeholder="Bengaluru, IN" />
+            </div>
+            <div>
+              <label for="workMode" class="mb-1.5 block text-sm font-medium">Work mode</label>
+              <select id="workMode" name="workMode" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">
+                ${['Onsite','Hybrid','Remote'].map(s => `<option ${draft.workMode===s?'selected':''}>${s}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="priority" class="mb-1.5 block text-sm font-medium">Priority</label>
+              <select id="priority" name="priority" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">
+                ${['low','medium','high'].map(s => `<option value="${s}" ${draft.priority===s?'selected':''}>${s.charAt(0).toUpperCase()+s.slice(1)}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <!-- AI block -->
+          <div class="rounded-lg border-2 border-dashed border-brand-200 bg-brand-50/40 p-4">
+            <div class="mb-2 flex items-center gap-2">
+              <span class="grid h-7 w-7 place-items-center rounded-md bg-brand-600 text-white">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>
+              </span>
+              <h3 class="text-sm font-semibold">Draft the JD with AI</h3>
+            </div>
+            <p class="mb-3 text-xs text-slate-600">Give 1–3 sentences of context, then let Claude write a structured description and requirements. You can edit afterwards.</p>
+            <textarea id="ai-brief" rows="2" placeholder="e.g. Reports to CTO, owns motion-planning stack for our second-gen industrial robot. Team of 8." class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20"></textarea>
+            <button type="button" data-action="ai-generate-jd" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60" ${state.aiLoading.jd?'disabled':''}>
+              ${state.aiLoading.jd ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+              ${state.aiLoading.jd ? 'Drafting…' : 'Generate with AI'}
+            </button>
+          </div>
+
+          <div>
+            <label for="description" class="mb-1.5 block text-sm font-medium">Description (Markdown)</label>
+            <textarea id="description" name="description" rows="8" class="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">${escapeHTML(draft.description || '')}</textarea>
+          </div>
+          <div>
+            <label for="requirements" class="mb-1.5 block text-sm font-medium">Requirements (Markdown)</label>
+            <textarea id="requirements" name="requirements" rows="6" class="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-xs outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">${escapeHTML(draft.requirements || '')}</textarea>
+          </div>
+
+          ${bannerHTML()}
+
+          <div class="flex justify-end gap-2 border-t border-slate-100 pt-4">
+            <button type="button" data-action="go" data-view="jobs" class="rounded-md border border-slate-200 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50">Cancel</button>
+            <button type="submit" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+              Create job
+            </button>
+          </div>
+        </form>
+        `}
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Job detail — pipeline
+  // =============================================================================
+  function mdToHtml(md) {
+    if (!md) return '';
+    // tiny markdown: ## headings, - lists, blank lines as paragraphs
+    const lines = md.split('\n');
+    let html = '', inList = false;
+    for (let line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('## ')) {
+        if (inList) { html += '</ul>'; inList = false; }
+        html += `<h4 class="mt-3 text-xs font-semibold uppercase tracking-wider text-slate-500">${escapeHTML(trimmed.slice(3))}</h4>`;
+      } else if (trimmed.startsWith('- ')) {
+        if (!inList) { html += '<ul class="mt-2 space-y-1 list-disc pl-5 text-sm text-slate-700">'; inList = true; }
+        html += `<li>${escapeHTML(trimmed.slice(2))}</li>`;
+      } else if (trimmed === '') {
+        if (inList) { html += '</ul>'; inList = false; }
+      } else {
+        if (inList) { html += '</ul>'; inList = false; }
+        html += `<p class="mt-2 text-sm text-slate-700">${escapeHTML(trimmed)}</p>`;
+      }
+    }
+    if (inList) html += '</ul>';
+    return html;
+  }
+
+  function renderJobDetail() {
+    const job = jobById(state.params.jobId);
+    if (!job) return renderShell(`<div class="p-10 text-center text-sm text-slate-500">Job not found. <a href="#" data-action="go" data-view="jobs" class="text-brand-600">Back to jobs</a></div>`);
+    const client = clientById(job.clientId);
+    const apps = applicationsForJob(job.id);
+    const byStage = STAGES.map(s => ({ ...s, apps: apps.filter(a => a.stage === s.id) }));
+
+    return renderShell(`
+      <div class="mx-auto max-w-7xl px-4 py-8 md:px-6 md:py-10">
+        <button data-action="go" data-view="jobs" class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg> Back to jobs
+        </button>
+
+        <header class="mb-6 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div class="flex items-center gap-2">${client ? clientChip(client) : ''}<span class="rounded-full ${job.status==='open'?'bg-emerald-50 text-emerald-700':'bg-slate-100 text-slate-600'} px-2 py-0.5 text-xs font-medium">${escapeHTML(job.status)}</span></div>
+            <h1 class="mt-2 text-2xl font-semibold tracking-tight md:text-3xl">${escapeHTML(job.title)}</h1>
+            <p class="mt-1 text-sm text-slate-600">${escapeHTML(job.seniority || '')} · ${escapeHTML(job.location || '')} · ${escapeHTML(job.workMode || '')} · Posted ${fmtRel(job.createdAt)}</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button data-action="open-add-candidate" data-job="${job.id}" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add candidate
+            </button>
+            <button data-action="ai-interview-kit" data-job="${job.id}" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-60" ${state.aiLoading.kit?'disabled':''}>
+              ${state.aiLoading.kit ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+              ${state.aiLoading.kit ? 'Generating…' : 'AI: Interview kit'}
+            </button>
+          </div>
+        </header>
+
+        <!-- Pipeline -->
+        <section class="mb-10">
+          <h2 class="mb-3 text-sm font-semibold">Pipeline (${apps.length})</h2>
+          <div class="pipeline-scroll flex gap-3 overflow-x-auto pb-3">
+            ${byStage.map(s => `
+              <div class="flex w-72 shrink-0 flex-col rounded-lg ${s.color.replace(/text-\S+/g,'').trim()} ${s.color.split(' ').filter(c => c.startsWith('border')).join(' ') || 'border-slate-200'} border">
+                <div class="flex items-center justify-between border-b border-slate-200/70 px-3 py-2">
+                  <p class="text-xs font-semibold uppercase tracking-wider ${s.color.split(' ').find(c => c.startsWith('text-'))}">${s.name}</p>
+                  <span class="text-xs font-medium tabular-nums opacity-70">${s.apps.length}</span>
+                </div>
+                <div class="flex-1 space-y-2 p-2">
+                  ${s.apps.length === 0 ? `<p class="px-2 py-3 text-center text-[11px] text-slate-400">Empty</p>` : s.apps.map(a => {
+                    const k = candidateById(a.candidateId);
+                    if (!k) return '';
+                    return `
+                      <article class="rounded-md border border-slate-200 bg-white p-2.5 transition hover:border-brand-300">
+                        <div class="flex items-start gap-2">
+                          <span class="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-600">${escapeHTML(initials(k.name))}</span>
+                          <div class="min-w-0 flex-1">
+                            <a href="#" data-action="go" data-view="candidateDetail" data-candidate="${k.id}" class="block truncate text-sm font-medium hover:text-brand-700">${escapeHTML(k.name)}</a>
+                            <p class="truncate text-[11px] text-slate-500">${escapeHTML(k.currentRole || '')}${k.yearsExperience ? ' · ' + k.yearsExperience + 'y' : ''}</p>
+                          </div>
+                        </div>
+                        <div class="mt-2 flex items-center justify-between gap-2">
+                          ${fitScorePill(a.fitScore)}
+                          <div class="flex items-center gap-1">
+                            ${a.fitScore == null ? `
+                              <button data-action="ai-fit" data-app="${a.id}" class="rounded-md bg-brand-600 px-1.5 py-1 text-[10px] font-medium text-white hover:bg-brand-700 disabled:opacity-60" ${state.aiLoading['fit:'+a.id]?'disabled':''} title="Compute AI fit score">
+                                ${state.aiLoading['fit:'+a.id] ? spinner('h-3 w-3') : 'AI fit'}
+                              </button>` : ''}
+                            <select data-action="move-stage" data-app="${a.id}" class="rounded-md border border-slate-200 bg-white px-1 py-0.5 text-[10px] font-medium hover:bg-slate-50">
+                              ${STAGES.map(st => `<option value="${st.id}" ${st.id===a.stage?'selected':''}>${st.name}</option>`).join('')}
+                            </select>
+                          </div>
+                        </div>
+                      </article>`;
+                  }).join('')}
+                </div>
+              </div>`).join('')}
+          </div>
+        </section>
+
+        <!-- JD -->
+        <section class="grid gap-6 lg:grid-cols-2">
+          <article class="rounded-lg border border-slate-200 bg-white p-6">
+            <h3 class="text-sm font-semibold">Description</h3>
+            <div class="mt-2 prose prose-sm max-w-none">${mdToHtml(job.description || '_No description._')}</div>
+          </article>
+          <article class="rounded-lg border border-slate-200 bg-white p-6">
+            <h3 class="text-sm font-semibold">Requirements</h3>
+            <div class="mt-2 prose prose-sm max-w-none">${mdToHtml(job.requirements || '_No requirements listed._')}</div>
+          </article>
+        </section>
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Candidates list
+  // =============================================================================
+  function renderCandidates() {
+    const all = state.data.candidates;
+    return renderShell(`
+      <div class="mx-auto max-w-6xl px-4 py-8 md:px-6 md:py-10">
+        <header class="mb-6 flex items-end justify-between">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">Candidates</h1>
+            <p class="mt-1 text-sm text-slate-600">${all.length} candidate${all.length===1?'':'s'} in your master pool.</p>
+          </div>
+          <button data-action="go" data-view="candidateNew" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add candidate
+          </button>
+        </header>
+
+        ${all.length === 0 ? `
+          <div class="rounded-lg border border-dashed border-slate-300 bg-white p-12 text-center">
+            <p class="text-sm font-medium">No candidates yet.</p>
+            <p class="mt-1 text-sm text-slate-500">Paste a resume — Claude will extract the structured details for you.</p>
+            <button data-action="go" data-view="candidateNew" class="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white hover:bg-brand-700">+ Add candidate</button>
+          </div>
+        ` : `
+          <div class="overflow-hidden rounded-lg border border-slate-200 bg-white">
+            <table class="w-full text-left">
+              <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                <tr>
+                  <th class="px-4 py-2.5">Name</th>
+                  <th class="px-4 py-2.5">Current</th>
+                  <th class="px-4 py-2.5">Experience</th>
+                  <th class="px-4 py-2.5">Skills</th>
+                  <th class="px-4 py-2.5">Applications</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                ${all.map(k => {
+                  const apps = applicationsForCandidate(k.id);
+                  return `
+                  <tr class="hover:bg-slate-50">
+                    <td class="px-4 py-3">
+                      <a href="#" data-action="go" data-view="candidateDetail" data-candidate="${k.id}" class="flex items-center gap-2.5">
+                        <span class="grid h-8 w-8 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600">${escapeHTML(initials(k.name))}</span>
+                        <div>
+                          <p class="font-medium text-slate-900">${escapeHTML(k.name)}</p>
+                          <p class="text-xs text-slate-500">${escapeHTML(k.email || '')}</p>
+                        </div>
+                      </a>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-slate-700">${escapeHTML(k.currentRole || '—')}<br/><span class="text-xs text-slate-500">${escapeHTML(k.currentCompany || '')}</span></td>
+                    <td class="px-4 py-3 text-sm tabular-nums">${k.yearsExperience != null ? k.yearsExperience + 'y' : '—'}</td>
+                    <td class="px-4 py-3"><div class="flex flex-wrap gap-1">${(k.skills||[]).slice(0,3).map(s => `<span class="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-700">${escapeHTML(s)}</span>`).join('')}${(k.skills||[]).length>3?`<span class="text-[10px] text-slate-500">+${k.skills.length-3}</span>`:''}</div></td>
+                    <td class="px-4 py-3 text-sm tabular-nums">${apps.length}</td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        `}
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Candidate — new (with AI parse)
+  // =============================================================================
+  function renderCandidateNew() {
+    const draft = state.params.draft || {};
+    return renderShell(`
+      <div class="mx-auto max-w-3xl px-4 py-8 md:px-6 md:py-10">
+        <header class="mb-6">
+          <button data-action="go" data-view="candidates" class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900">
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg> Back to candidates
+          </button>
+          <h1 class="text-2xl font-semibold tracking-tight">Add candidate</h1>
+          <p class="mt-1 text-sm text-slate-600">Paste a resume or LinkedIn copy — Claude will extract structured details.</p>
+        </header>
+
+        <!-- AI parse block -->
+        <div class="mb-6 rounded-lg border-2 border-dashed border-brand-200 bg-brand-50/40 p-4">
+          <div class="mb-2 flex items-center gap-2">
+            <span class="grid h-7 w-7 place-items-center rounded-md bg-brand-600 text-white">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>
+            </span>
+            <h3 class="text-sm font-semibold">Parse resume with AI</h3>
+          </div>
+          <textarea id="ai-resume" rows="6" placeholder="Paste resume text or LinkedIn profile here…" class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20"></textarea>
+          <button type="button" data-action="ai-parse-resume" class="mt-2 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60" ${state.aiLoading.parse?'disabled':''}>
+            ${state.aiLoading.parse ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+            ${state.aiLoading.parse ? 'Parsing…' : 'Extract details'}
+          </button>
+        </div>
+
+        <form id="candidate-form" class="space-y-6 rounded-lg border border-slate-200 bg-white p-6">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div class="sm:col-span-2">
+              <label for="name" class="mb-1.5 block text-sm font-medium">Full name <span class="text-red-500">*</span></label>
+              <input id="name" name="name" type="text" required value="${escapeHTML(draft.name || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="email" class="mb-1.5 block text-sm font-medium">Email</label>
+              <input id="email" name="email" type="email" value="${escapeHTML(draft.email || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="phone" class="mb-1.5 block text-sm font-medium">Phone</label>
+              <input id="phone" name="phone" type="tel" value="${escapeHTML(draft.phone || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="currentRole" class="mb-1.5 block text-sm font-medium">Current role</label>
+              <input id="currentRole" name="currentRole" type="text" value="${escapeHTML(draft.currentRole || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="currentCompany" class="mb-1.5 block text-sm font-medium">Current company</label>
+              <input id="currentCompany" name="currentCompany" type="text" value="${escapeHTML(draft.currentCompany || '')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="yearsExperience" class="mb-1.5 block text-sm font-medium">Years experience</label>
+              <input id="yearsExperience" name="yearsExperience" type="number" min="0" max="60" value="${draft.yearsExperience != null ? draft.yearsExperience : ''}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div>
+              <label for="source" class="mb-1.5 block text-sm font-medium">Source</label>
+              <input id="source" name="source" type="text" value="${escapeHTML(draft.source || '')}" placeholder="LinkedIn, Referral, …" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div class="sm:col-span-2">
+              <label for="skills" class="mb-1.5 block text-sm font-medium">Skills (comma-separated)</label>
+              <input id="skills" name="skills" type="text" value="${escapeHTML((draft.skills || []).join(', '))}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+            </div>
+            <div class="sm:col-span-2">
+              <label for="summary" class="mb-1.5 block text-sm font-medium">Summary</label>
+              <textarea id="summary" name="summary" rows="3" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20">${escapeHTML(draft.summary || '')}</textarea>
+            </div>
+          </div>
+
+          ${bannerHTML()}
+
+          <div class="flex justify-end gap-2 border-t border-slate-100 pt-4">
+            <button type="button" data-action="go" data-view="candidates" class="rounded-md border border-slate-200 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50">Cancel</button>
+            <button type="submit" class="rounded-md bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">Add candidate</button>
+          </div>
+        </form>
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Candidate detail
+  // =============================================================================
+  function renderCandidateDetail() {
+    const k = candidateById(state.params.candidateId);
+    if (!k) return renderShell(`<div class="p-10 text-center text-sm text-slate-500">Candidate not found. <a href="#" data-action="go" data-view="candidates" class="text-brand-600">Back</a></div>`);
+    const apps = applicationsForCandidate(k.id);
+    const summary = state.params.aiSummary || k.aiSummary;
+
+    return renderShell(`
+      <div class="mx-auto max-w-5xl px-4 py-8 md:px-6 md:py-10">
+        <button data-action="go" data-view="candidates" class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg> Back to candidates
+        </button>
+
+        <header class="mb-6 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div class="flex items-start gap-4">
+            <span class="grid h-14 w-14 place-items-center rounded-full bg-slate-100 text-base font-semibold text-slate-600">${escapeHTML(initials(k.name))}</span>
+            <div>
+              <h1 class="text-2xl font-semibold tracking-tight md:text-3xl">${escapeHTML(k.name)}</h1>
+              <p class="mt-1 text-sm text-slate-600">${escapeHTML(k.currentRole || '')}${k.currentCompany ? ' at ' + escapeHTML(k.currentCompany) : ''}</p>
+              <p class="mt-1 text-xs text-slate-500">${escapeHTML(k.email || '')}${k.phone ? ' · ' + escapeHTML(k.phone) : ''}${k.source ? ' · Source: ' + escapeHTML(k.source) : ''}</p>
+            </div>
+          </div>
+          <button data-action="ai-summary" data-candidate="${k.id}" class="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-60" ${state.aiLoading['summary:'+k.id]?'disabled':''}>
+            ${state.aiLoading['summary:'+k.id] ? spinner('h-3.5 w-3.5') : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>'}
+            ${state.aiLoading['summary:'+k.id] ? 'Generating…' : 'AI: Client-ready summary'}
+          </button>
+        </header>
+
+        ${summary ? `
+          <section class="mb-6 rounded-lg border border-brand-200 bg-brand-50/40 p-5">
+            <p class="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-brand-700">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z"/></svg>
+              AI summary for hiring manager
+            </p>
+            <p class="text-sm leading-relaxed text-slate-800">${escapeHTML(summary)}</p>
+          </section>
+        ` : ''}
+
+        <div class="grid gap-6 lg:grid-cols-3">
+          <article class="rounded-lg border border-slate-200 bg-white p-6 lg:col-span-2">
+            <h2 class="text-sm font-semibold">Profile</h2>
+            <dl class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <dt class="text-xs uppercase tracking-wider text-slate-500">Years of experience</dt>
+                <dd class="mt-0.5 text-sm tabular-nums">${k.yearsExperience != null ? k.yearsExperience : '—'}</dd>
+              </div>
+              <div>
+                <dt class="text-xs uppercase tracking-wider text-slate-500">Source</dt>
+                <dd class="mt-0.5 text-sm">${escapeHTML(k.source || '—')}</dd>
+              </div>
+              <div class="sm:col-span-2">
+                <dt class="text-xs uppercase tracking-wider text-slate-500">Skills</dt>
+                <dd class="mt-1 flex flex-wrap gap-1.5">${(k.skills||[]).map(s => `<span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">${escapeHTML(s)}</span>`).join('') || '—'}</dd>
+              </div>
+              <div class="sm:col-span-2">
+                <dt class="text-xs uppercase tracking-wider text-slate-500">Summary</dt>
+                <dd class="mt-1 text-sm leading-relaxed text-slate-700">${escapeHTML(k.summary || '—')}</dd>
+              </div>
+            </dl>
+          </article>
+
+          <article class="rounded-lg border border-slate-200 bg-white p-6">
+            <h2 class="text-sm font-semibold">Applications (${apps.length})</h2>
+            ${apps.length === 0 ? `
+              <p class="mt-3 text-sm text-slate-500">Not applied to any roles yet.</p>
+            ` : `
+              <ul class="mt-3 space-y-3">
+                ${apps.map(a => {
+                  const j = jobById(a.jobId);
+                  if (!j) return '';
+                  const stage = STAGE_BY_ID[a.stage];
+                  return `
+                    <li class="rounded-md border border-slate-100 p-3">
+                      <a href="#" data-action="go" data-view="jobDetail" data-job="${j.id}" class="block">
+                        <p class="text-sm font-medium hover:text-brand-700">${escapeHTML(j.title)}</p>
+                      </a>
+                      <div class="mt-1 flex items-center gap-2">
+                        <span class="rounded-full ${stage.color} border px-2 py-0.5 text-[10px] font-medium">${stage.name}</span>
+                        ${fitScorePill(a.fitScore)}
+                      </div>
+                      ${a.fitSummary ? `<p class="mt-2 text-xs text-slate-600">${escapeHTML(a.fitSummary)}</p>` : ''}
+                    </li>`;
+                }).join('')}
+              </ul>
+            `}
+          </article>
+        </div>
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Clients
+  // =============================================================================
+  function renderClients() {
+    return renderShell(`
+      <div class="mx-auto max-w-5xl px-4 py-8 md:px-6 md:py-10">
+        <header class="mb-6 flex items-end justify-between">
+          <div>
+            <h1 class="text-2xl font-semibold tracking-tight">Clients</h1>
+            <p class="mt-1 text-sm text-slate-600">${state.data.clients.length} client${state.data.clients.length===1?'':'s'} in your portfolio.</p>
+          </div>
+          <button data-action="go" data-view="clientNew" class="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New client
+          </button>
+        </header>
+
+        ${state.data.clients.length === 0 ? `
+          <div class="rounded-lg border border-dashed border-slate-300 bg-white p-12 text-center">
+            <p class="text-sm font-medium">No clients yet.</p>
+            <button data-action="go" data-view="clientNew" class="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-2 text-sm font-medium text-white">+ Add client</button>
+          </div>
+        ` : `
+          <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            ${state.data.clients.map(c => {
+              const dot = CLIENT_COLORS[c.colorIdx % CLIENT_COLORS.length];
+              const jobsCount = state.data.jobs.filter(j => j.clientId === c.id).length;
+              const candidatesCount = state.data.applications.filter(a => state.data.jobs.find(j => j.id === a.jobId && j.clientId === c.id)).length;
+              return `
+                <article class="rounded-lg border border-slate-200 bg-white p-5 transition hover:border-brand-200">
+                  <div class="flex items-center gap-2">
+                    <span class="${dot} h-2 w-2 rounded-full"></span>
+                    <h3 class="font-semibold text-slate-900">${escapeHTML(c.name)}</h3>
+                  </div>
+                  <p class="mt-0.5 text-xs text-slate-500">${escapeHTML(c.industry || '')}</p>
+                  <dl class="mt-4 grid grid-cols-2 gap-3">
+                    <div>
+                      <dt class="text-[10px] uppercase tracking-wider text-slate-500">Jobs</dt>
+                      <dd class="text-lg font-semibold tabular-nums">${jobsCount}</dd>
+                    </div>
+                    <div>
+                      <dt class="text-[10px] uppercase tracking-wider text-slate-500">Candidates</dt>
+                      <dd class="text-lg font-semibold tabular-nums">${candidatesCount}</dd>
+                    </div>
+                  </dl>
+                  <button data-action="set-client-and-go" data-client="${c.id}" class="mt-4 w-full rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium hover:bg-slate-50">Switch to this client</button>
+                </article>`;
+            }).join('')}
+          </div>
+        `}
+      </div>
+    `);
+  }
+
+  function renderClientNew() {
+    const draft = state.params.draft || {};
+    return renderShell(`
+      <div class="mx-auto max-w-xl px-4 py-8 md:px-6 md:py-10">
+        <button data-action="go" data-view="clients" class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg> Back to clients
+        </button>
+        <h1 class="text-2xl font-semibold tracking-tight">New client</h1>
+        <form id="client-form" class="mt-6 space-y-4 rounded-lg border border-slate-200 bg-white p-6">
+          <div>
+            <label class="mb-1.5 block text-sm font-medium">Client name <span class="text-red-500">*</span></label>
+            <input name="name" type="text" required value="${escapeHTML(draft.name||'')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" />
+          </div>
+          <div>
+            <label class="mb-1.5 block text-sm font-medium">Industry</label>
+            <input name="industry" type="text" value="${escapeHTML(draft.industry||'')}" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand-600 focus:ring-2 focus:ring-brand-600/20" placeholder="SaaS, Healthcare, Hardware, …" />
+          </div>
+          ${bannerHTML()}
+          <div class="flex justify-end gap-2 border-t border-slate-100 pt-4">
+            <button type="button" data-action="go" data-view="clients" class="rounded-md border border-slate-200 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50">Cancel</button>
+            <button type="submit" class="rounded-md bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700">Add client</button>
+          </div>
+        </form>
+      </div>
+    `);
+  }
+
+  // =============================================================================
+  // Modals
+  // =============================================================================
+  function showModal(html, opts = {}) {
+    state.modal = { html, opts };
+    renderModal();
+  }
+  function closeModal() {
+    state.modal = null;
+    renderModal();
+  }
+  function renderModal() {
+    const root = document.getElementById('modal-root');
+    if (!state.modal) { root.innerHTML = ''; return; }
+    root.innerHTML = `
+      <div class="modal-backdrop fixed inset-0 z-40 bg-slate-900/40" data-action="close-modal"></div>
+      <div class="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+        <div class="pointer-events-auto fade-in w-full ${state.modal.opts.size === 'lg' ? 'max-w-3xl' : 'max-w-md'} rounded-xl border border-slate-200 bg-white shadow-xl">
+          ${state.modal.html}
+        </div>
+      </div>`;
+    bindModalEvents();
+  }
+
+  function showAddCandidateModal(jobId) {
+    const job = jobById(jobId);
+    if (!job) return;
+    const existingApps = applicationsForJob(jobId).map(a => a.candidateId);
+    const eligible = state.data.candidates.filter(c => !existingApps.includes(c.id));
+    showModal(`
+      <div class="border-b border-slate-100 px-5 py-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-base font-semibold">Add candidate to: ${escapeHTML(job.title)}</h3>
+          <button data-action="close-modal" class="text-slate-400 hover:text-slate-600"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        </div>
+      </div>
+      <div class="max-h-[60vh] overflow-y-auto px-5 py-4">
+        ${eligible.length === 0 ? `
+          <p class="py-6 text-center text-sm text-slate-500">All your candidates are already on this job. <a href="#" data-action="close-and-go" data-view="candidateNew" class="font-medium text-brand-600">Add a new candidate?</a></p>
+        ` : `
+          <ul class="space-y-2">
+            ${eligible.map(k => `
+              <li>
+                <button data-action="add-application" data-candidate="${k.id}" data-job="${jobId}" class="flex w-full items-start gap-3 rounded-md border border-slate-200 p-3 text-left hover:border-brand-300 hover:bg-brand-50/40">
+                  <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600">${escapeHTML(initials(k.name))}</span>
+                  <div class="min-w-0 flex-1">
+                    <p class="truncate text-sm font-medium">${escapeHTML(k.name)}</p>
+                    <p class="truncate text-xs text-slate-500">${escapeHTML(k.currentRole || '')}${k.yearsExperience ? ' · ' + k.yearsExperience + 'y' : ''}</p>
+                  </div>
+                  <span class="text-xs text-brand-600">Add →</span>
+                </button>
+              </li>`).join('')}
+          </ul>
+          <div class="mt-4 border-t border-slate-100 pt-4 text-center">
+            <a href="#" data-action="close-and-go" data-view="candidateNew" class="text-xs font-medium text-brand-600">+ Add a new candidate</a>
+          </div>
+        `}
+      </div>
+    `, { size: 'lg' });
+  }
+
+  function showInterviewKitModal(questions) {
+    const list = (questions || []).map((q, i) => `
+      <article class="rounded-md border border-slate-200 p-3">
+        <div class="flex items-start gap-2">
+          <span class="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-brand-600 text-[10px] font-semibold text-white">${i+1}</span>
+          <div class="min-w-0">
+            <p class="text-sm font-medium leading-snug">${escapeHTML(q.question)}</p>
+            <p class="mt-1 text-[11px] uppercase tracking-wider text-slate-500">${escapeHTML(q.competency || '')}</p>
+            ${q.lookFor ? `<p class="mt-1.5 text-xs text-slate-600"><span class="font-medium">Look for:</span> ${escapeHTML(q.lookFor)}</p>` : ''}
+          </div>
+        </div>
+      </article>`).join('');
+    showModal(`
+      <div class="border-b border-slate-100 px-5 py-4">
+        <div class="flex items-center justify-between">
+          <h3 class="text-base font-semibold">AI-generated interview kit</h3>
+          <button data-action="close-modal" class="text-slate-400 hover:text-slate-600"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+        </div>
+      </div>
+      <div class="max-h-[70vh] space-y-3 overflow-y-auto px-5 py-4">${list || '<p class="text-sm text-slate-500">No questions generated.</p>'}</div>
+      <div class="border-t border-slate-100 px-5 py-3 text-right">
+        <button data-action="close-modal" class="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50">Close</button>
+      </div>
+    `, { size: 'lg' });
+  }
+
+  // =============================================================================
+  // Master render
+  // =============================================================================
+  function render() {
+    const root = document.getElementById('app');
+    let html = '';
+    switch (state.view) {
+      case 'loading':         html = `<div class="auth-bg flex min-h-screen items-center justify-center"><div class="flex items-center gap-2 text-slate-500">${spinner('h-5 w-5')}<span class="text-sm">Loading…</span></div></div>`; break;
+      case 'login':           html = renderLogin(); break;
+      case 'signup':          html = renderSignup(); break;
+      case 'dashboard':       html = renderDashboard(); break;
+      case 'jobs':            html = renderJobs(); break;
+      case 'jobNew':          html = renderJobNew(); break;
+      case 'jobDetail':       html = renderJobDetail(); break;
+      case 'candidates':      html = renderCandidates(); break;
+      case 'candidateNew':    html = renderCandidateNew(); break;
+      case 'candidateDetail': html = renderCandidateDetail(); break;
+      case 'clients':         html = renderClients(); break;
+      case 'clientNew':       html = renderClientNew(); break;
+      default:                html = renderDashboard();
+    }
+    root.innerHTML = html;
+    bindEvents();
+  }
+
+  // =============================================================================
+  // Event binding (delegation)
+  // =============================================================================
+  function bindEvents() {
+    document.body.onclick = (e) => {
+      const target = e.target.closest('[data-action]');
+      if (!target) return;
+
+      const action = target.dataset.action;
+
+      if (action === 'go') {
+        e.preventDefault();
+        const view = target.dataset.view;
+        const params = {};
+        if (target.dataset.job) params.jobId = target.dataset.job;
+        if (target.dataset.candidate) params.candidateId = target.dataset.candidate;
+        go(view, params);
+      } else if (action === 'signout') {
+        e.preventDefault();
+        handleSignout();
+      } else if (action === 'toggle-client-switcher') {
+        document.getElementById('client-switcher')?.classList.toggle('hidden');
+      } else if (action === 'set-client') {
+        state.activeClientId = target.dataset.client || null;
+        document.getElementById('client-switcher')?.classList.add('hidden');
+        render();
+      } else if (action === 'set-client-and-go') {
+        state.activeClientId = target.dataset.client;
+        go('jobs');
+      } else if (action === 'ai-generate-jd') {
+        e.preventDefault();
+        handleAIGenerateJD();
+      } else if (action === 'ai-parse-resume') {
+        e.preventDefault();
+        handleAIParseResume();
+      } else if (action === 'ai-fit') {
+        e.preventDefault();
+        handleAIFit(target.dataset.app);
+      } else if (action === 'ai-interview-kit') {
+        e.preventDefault();
+        handleAIInterviewKit(target.dataset.job);
+      } else if (action === 'ai-summary') {
+        e.preventDefault();
+        handleAICandidateSummary(target.dataset.candidate);
+      } else if (action === 'open-add-candidate') {
+        e.preventDefault();
+        showAddCandidateModal(target.dataset.job);
+      } else if (action === 'add-application') {
+        e.preventDefault();
+        handleAddApplication(target.dataset.candidate, target.dataset.job);
+      } else if (action === 'close-modal') {
+        closeModal();
+      } else if (action === 'close-and-go') {
+        e.preventDefault();
+        const view = target.dataset.view;
+        closeModal();
+        go(view);
+      }
+    };
+
+    document.body.onchange = async (e) => {
+      const target = e.target.closest('[data-action="move-stage"]');
+      if (!target) return;
+      const appId = target.dataset.app;
+      const newStage = target.value;
+      await updateApplication(appId, { stage: newStage });
+      toast('Stage updated', 'success');
+      render();
+    };
+
+    // Close client-switcher when clicking outside
+    document.addEventListener('click', (e) => {
+      const sw = document.getElementById('client-switcher');
+      if (sw && !sw.classList.contains('hidden')) {
+        if (!e.target.closest('#client-switcher') && !e.target.closest('[data-action="toggle-client-switcher"]')) {
+          sw.classList.add('hidden');
+        }
+      }
+    }, { once: true });
+
+    const lf = document.getElementById('login-form');
+    if (lf) lf.onsubmit = (e) => { e.preventDefault(); handleLogin(lf); };
+    const sf = document.getElementById('signup-form');
+    if (sf) sf.onsubmit = (e) => { e.preventDefault(); handleSignup(sf); };
+    const jf = document.getElementById('job-form');
+    if (jf) jf.onsubmit = (e) => { e.preventDefault(); handleJobSubmit(jf); };
+    const cf = document.getElementById('candidate-form');
+    if (cf) cf.onsubmit = (e) => { e.preventDefault(); handleCandidateSubmit(cf); };
+    const clf = document.getElementById('client-form');
+    if (clf) clf.onsubmit = (e) => { e.preventDefault(); handleClientSubmit(clf); };
+  }
+
+  function bindModalEvents() {
+    // Modal events use the same delegated handler via bindEvents.
+  }
+
+  // =============================================================================
+  // Form & AI handlers
+  // =============================================================================
+  async function handleJobSubmit(form) {
+    const fd = new FormData(form);
+    const payload = {
+      title: (fd.get('title')||'').toString().trim(),
+      clientId: (fd.get('clientId')||'').toString(),
+      seniority: (fd.get('seniority')||'').toString(),
+      location: (fd.get('location')||'').toString().trim(),
+      workMode: (fd.get('workMode')||'').toString(),
+      priority: (fd.get('priority')||'medium').toString(),
+      description: (fd.get('description')||'').toString(),
+      requirements: (fd.get('requirements')||'').toString(),
+    };
+    if (!payload.title) { state.error = 'Title is required.'; render(); return; }
+    if (!payload.clientId) { state.error = 'Client is required.'; render(); return; }
+    const job = await createJob(payload);
+    toast('Job created', 'success');
+    go('jobDetail', { jobId: job.id });
+  }
+
+  async function handleCandidateSubmit(form) {
+    const fd = new FormData(form);
+    const skillsStr = (fd.get('skills')||'').toString();
+    const yrs = (fd.get('yearsExperience')||'').toString();
+    const payload = {
+      name: (fd.get('name')||'').toString().trim(),
+      email: (fd.get('email')||'').toString().trim(),
+      phone: (fd.get('phone')||'').toString().trim(),
+      currentRole: (fd.get('currentRole')||'').toString().trim(),
+      currentCompany: (fd.get('currentCompany')||'').toString().trim(),
+      yearsExperience: yrs ? parseInt(yrs, 10) : null,
+      source: (fd.get('source')||'').toString().trim(),
+      summary: (fd.get('summary')||'').toString().trim(),
+      skills: skillsStr.split(',').map(s => s.trim()).filter(Boolean),
+    };
+    if (!payload.name) { state.error = 'Name is required.'; render(); return; }
+    const k = await createCandidate(payload);
+    toast('Candidate added', 'success');
+    go('candidateDetail', { candidateId: k.id });
+  }
+
+  async function handleClientSubmit(form) {
+    const fd = new FormData(form);
+    const name = (fd.get('name')||'').toString().trim();
+    const industry = (fd.get('industry')||'').toString().trim();
+    if (!name) { state.error = 'Name is required.'; render(); return; }
+    await createClient({ name, industry });
+    toast('Client added', 'success');
+    go('clients');
+  }
+
+  async function handleAIGenerateJD() {
+    const form = document.getElementById('job-form');
+    const brief = document.getElementById('ai-brief')?.value || '';
+    const fd = new FormData(form);
+    const title = (fd.get('title')||'').toString().trim();
+    if (!title) { toast('Add a job title first', 'error'); return; }
+    const clientId = (fd.get('clientId')||'').toString();
+    const client = clientById(clientId);
+
+    state.aiLoading.jd = true; render();
+    // Re-fill brief field
+    const briefEl = document.getElementById('ai-brief');
+    if (briefEl) briefEl.value = brief;
+
+    try {
+      const result = await aiGenerateJD({
+        title,
+        seniority: (fd.get('seniority')||'').toString(),
+        location: (fd.get('location')||'').toString(),
+        workMode: (fd.get('workMode')||'').toString(),
+        clientName: client?.name,
+        industry: client?.industry,
+        brief,
+      });
+      // Save current draft + AI output, re-render the form with values
+      const draft = {
+        title,
+        clientId,
+        seniority: (fd.get('seniority')||'').toString(),
+        location: (fd.get('location')||'').toString(),
+        workMode: (fd.get('workMode')||'').toString(),
+        priority: (fd.get('priority')||'medium').toString(),
+        description: result.description || '',
+        requirements: result.requirements || '',
+      };
+      state.aiLoading.jd = false;
+      go('jobNew', { draft });
+      toast('JD drafted by AI — review and edit before saving', 'success');
+    } catch (err) {
+      state.aiLoading.jd = false;
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  async function handleAIParseResume() {
+    const text = document.getElementById('ai-resume')?.value?.trim() || '';
+    if (text.length < 30) { toast('Paste at least a few lines of resume text', 'error'); return; }
+    state.aiLoading.parse = true; render();
+    // re-fill the textarea after re-render below would erase it; we accept this trade-off
+    try {
+      const parsed = await aiParseResume(text);
+      const draft = {
+        name: parsed.name || '',
+        email: parsed.email || '',
+        phone: parsed.phone || '',
+        currentRole: parsed.currentRole || '',
+        currentCompany: parsed.currentCompany || '',
+        yearsExperience: parsed.yearsExperience ?? null,
+        skills: Array.isArray(parsed.skills) ? parsed.skills : [],
+        summary: parsed.summary || '',
+        source: 'AI-parsed',
+      };
+      state.aiLoading.parse = false;
+      go('candidateNew', { draft });
+      toast('Resume parsed — review the fields before saving', 'success');
+    } catch (err) {
+      state.aiLoading.parse = false;
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  async function handleAIFit(appId) {
+    const a = state.data.applications.find(x => x.id === appId);
+    if (!a) return;
+    const k = candidateById(a.candidateId);
+    const j = jobById(a.jobId);
+    if (!k || !j) return;
+    state.aiLoading['fit:'+appId] = true; render();
+    try {
+      const result = await aiFitScore({ candidate: k, job: j });
+      await updateApplication(appId, {
+        fitScore: typeof result.score === 'number' ? Math.round(result.score) : null,
+        fitSummary: result.summary || null,
+        strengths: Array.isArray(result.strengths) ? result.strengths : [],
+        gaps: Array.isArray(result.gaps) ? result.gaps : [],
+      });
+      delete state.aiLoading['fit:'+appId];
+      toast(`Fit score: ${result.score}`, 'success');
+      render();
+    } catch (err) {
+      delete state.aiLoading['fit:'+appId];
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  async function handleAIInterviewKit(jobId) {
+    const job = jobById(jobId);
+    if (!job) return;
+    state.aiLoading.kit = true; render();
+    try {
+      const result = await aiInterviewQuestions(job);
+      state.aiLoading.kit = false;
+      render();
+      showInterviewKitModal(result.questions || []);
+    } catch (err) {
+      state.aiLoading.kit = false;
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  async function handleAICandidateSummary(candidateId) {
+    const k = candidateById(candidateId);
+    if (!k) return;
+    state.aiLoading['summary:'+candidateId] = true; render();
+    try {
+      const apps = applicationsForCandidate(candidateId);
+      const summary = await aiCandidateSummary({ candidate: k, applications: apps, jobs: state.data.jobs });
+      delete state.aiLoading['summary:'+candidateId];
+      // Also persist on the candidate
+      await updateCandidate(candidateId, { aiSummary: summary });
+      go('candidateDetail', { candidateId, aiSummary: summary });
+      toast('Summary generated', 'success');
+    } catch (err) {
+      delete state.aiLoading['summary:'+candidateId];
+      render();
+      toast('AI failed: ' + err.message, 'error');
+    }
+  }
+
+  async function handleAddApplication(candidateId, jobId) {
+    await createApplication(candidateId, jobId);
+    closeModal();
+    toast('Candidate added to job', 'success');
+    render();
+  }
+
+  // =============================================================================
+  // Init
+  // =============================================================================
+  async function init() {
+    try {
+      await initSupabase();
+    } catch (e) {
+      state.view = 'login';
+      state.error = e.message;
+      render();
+      return;
+    }
+
+    const user = await getCurrentUser();
+    if (user) {
+      state.user = user;
+      try {
+        state.data = await loadOrSeedData();
+        state.activeClientId = null;
+        state.view = 'dashboard';
+      } catch (e) {
+        state.view = 'login';
+        state.error = 'Workspace load failed: ' + e.message;
+      }
+    } else {
+      state.view = 'login';
+    }
+    render();
+
+    // React to sign-out from another tab
+    supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT' && state.user) {
+        state.user = null;
+        state.data = { clients: [], jobs: [], candidates: [], applications: [] };
+        state.activeClientId = null;
+        state.view = 'login';
+        render();
+      }
+    });
+  }
+
+  init();
+</script>
+</body>
+</html>
